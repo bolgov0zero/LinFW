@@ -95,8 +95,8 @@ class LinFWApp(App):
     .row RadioSet { layout: horizontal; width: 1fr; height: auto; border: none; padding: 0; background: transparent; }
     .row RadioButton { width: auto; padding: 0 2 0 0; background: transparent; }
     #error { color: $error; height: auto; margin-bottom: 1; }
-    .buttons { height: 3; align-horizontal: center; }
-    .buttons Button { margin: 0 1; }
+    .buttons { height: 1; align-horizontal: center; }
+    .buttons Button { min-width: 0; height: 1; border: none; padding: 0 2; margin: 0 1; }
     .dialog OptionList { height: auto; max-height: 10; border: tall $primary; }
     """
 
