@@ -125,13 +125,15 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null; then
   say "Устанавливаю службу журнала linfw-logd"
   cat > /etc/systemd/system/linfw-logd.service <<UNIT
 [Unit]
-Description=LinFW rule hit logger (iptables NFLOG)
-After=network.target
+Description=LinFW background service: rule hit journal and persistent counters
+# started after the firewall is restored, stopped before it is torn down, so the last counters are saved
+After=network.target netfilter-persistent.service iptables.service
 
 [Service]
 ExecStart=$PREFIX/bin/linfw --logd
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target
@@ -140,7 +142,7 @@ UNIT
   systemctl enable linfw-logd >/dev/null 2>&1 || warn "не удалось включить linfw-logd"
   systemctl restart linfw-logd || warn "linfw-logd не запустился: journalctl -u linfw-logd"
 else
-  warn "systemd не найден: журнал срабатываний не будет работать. Службу запускают командой: linfw --logd"
+  warn "systemd не найден: журнал срабатываний и сохранение счётчиков не будут работать. Службу запускают командой: linfw --logd"
 fi
 
 # --- 5. done ---------------------------------------------------------------

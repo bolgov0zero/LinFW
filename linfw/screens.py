@@ -12,7 +12,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Checkbox, DataTable, Input, Label, OptionList, RadioButton, RadioSet, Static
 from textual.widgets.option_list import Option
 
-from .journal import LogEntry
+from .journal import MAX_ENTRIES, RETENTION_DAYS, LogEntry
 from .model import ACTIONS, CHAINS, PROTOCOLS, FirewallError, NewRule, Rule
 
 ACTION_STYLE = {"accept": "bold #2ecc71", "drop": "bold #ff5555", "reject": "bold #ff9f1a"}
@@ -227,7 +227,7 @@ class JournalScreen(Screen):
 
     async def _poll(self) -> None:
         try:
-            self._source, self._entries = await asyncio.to_thread(self.fw.read_journal)
+            self._source, self._entries = await asyncio.to_thread(self.fw.read_journal, self.filter)
             self._error = ""
             self._why_empty = "" if self._entries else await self._explain_empty()
         except FirewallError as exc:
@@ -264,12 +264,12 @@ class JournalScreen(Screen):
 
     def _redraw(self) -> None:
         table = self.query_one("#jtable", JournalTable)
-        shown = [e for e in reversed(self._entries) if self.filter in (None, e.chain)]
+        shown = list(reversed(self._entries))  # the reader already applied the chain filter
         if shown != self._shown:
             row, scroll = table.cursor_row, table.scroll_y
             table.clear()
-            for e in shown:
-                table.add_row(
+            table.add_rows(
+                (
                     e.time,
                     e.chain.lower(),
                     e.protocol,
@@ -278,6 +278,8 @@ class JournalScreen(Screen):
                     e.port,
                     Text(e.action, style=ACTION_STYLE.get(e.action, "bold")),
                 )
+                for e in shown
+            )
             if shown:
                 table.move_cursor(row=min(row, len(shown) - 1), animate=False)
             table.scroll_y = scroll
@@ -288,8 +290,9 @@ class JournalScreen(Screen):
         elif not self._entries:
             status.update(self._why_empty or "Записей нет.")
         else:
+            count = f"последние {MAX_ENTRIES}" if len(shown) >= MAX_ENTRIES else str(len(shown))
             status.update(
-                f"Источник: {self._source}  ·  показано {len(shown)} из {len(self._entries)}"
+                f"Источник: {self._source}  ·  записей: {count}  ·  хранится {RETENTION_DAYS} дн."
                 "  ·  ←→ цепочка  ·  Esc назад"
             )
 
@@ -297,7 +300,7 @@ class JournalScreen(Screen):
         self.filter = chain
         self._shown = None
         self._mark_filter()
-        self._redraw()
+        self.run_worker(self._poll(), exclusive=True)
 
     @on(Button.Pressed, ".jfilter")
     def _filter_pressed(self, event: Button.Pressed) -> None:

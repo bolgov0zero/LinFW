@@ -18,12 +18,14 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=f"linfw {__version__}")
     args = parser.parse_args()
 
+    from .counters import COUNTERS_FILE, CounterStore
     from .firewall import Firewall, SystemRunner
 
     if args.demo:
         from .demo import DemoRunner
 
         runner = DemoRunner()
+        counters = CounterStore(None)
     else:
         if not sys.platform.startswith("linux"):
             sys.exit("LinFW работает только в Linux. Для знакомства с интерфейсом: linfw --demo")
@@ -36,6 +38,7 @@ def main() -> None:
             runner = SystemRunner()
         except FirewallError as exc:
             sys.exit(str(exc))
+        counters = CounterStore(COUNTERS_FILE)
 
     if args.logd:
         from . import logd
@@ -43,7 +46,7 @@ def main() -> None:
         logd.run()
         return
 
-    fw = Firewall(runner)
+    fw = Firewall(runner, counters)
     if args.apply_base or args.remove_base:
         try:
             if args.apply_base:

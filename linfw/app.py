@@ -29,6 +29,8 @@ REFRESH_SECONDS = 2.0
 
 
 def humanize(n: int) -> str:
+    if n < 100_000_000:  # exact, with spaces between thousands: 1 532 407
+        return f"{n:,}".replace(",", " ")
     value = float(n)
     for unit in ("", "K", "M", "G", "T"):
         if value < 1000:
@@ -37,12 +39,12 @@ def humanize(n: int) -> str:
     return f"{value:.1f}P"
 
 
-def row_cells(rule: Rule) -> List[Text]:
+def row_cells(rule: Rule, pkts: Optional[int] = None) -> List[Text]:
     dim = "" if rule.enabled else "dim"
     action = rule.action + (" ●" if rule.log else "") + ("" if rule.enabled else " (off)")
     cells = [
         Text(str(rule.number), style=dim, justify="right"),
-        Text(humanize(rule.pkts), style=dim, justify="right"),
+        Text(humanize(rule.pkts if pkts is None else pkts), style=dim, justify="right"),
         Text(rule.chain.lower(), style=dim),
         Text(rule.protocol, style=dim),
         Text(rule.source or "any", style=dim),
@@ -136,6 +138,7 @@ class LinFWApp(App):
         self._lock = asyncio.Lock()
         self._persist_note = ""
         self._base_failed = False
+        self._totals: Dict[str, Tuple[int, int]] = {}  # running totals that survive counter resets
 
     # -- layout ----------------------------------------------------------
 
@@ -187,7 +190,7 @@ class LinFWApp(App):
             return
         async with self._lock:
             try:
-                self.snapshot = await asyncio.to_thread(self.fw.snapshot)
+                await self._load_snapshot()
             except FirewallError as exc:
                 self.notify(str(exc), severity="error", timeout=8)
                 return
@@ -209,8 +212,15 @@ class LinFWApp(App):
             await asyncio.to_thread(self.fw.persist)
         except FirewallError as exc:
             self.notify(str(exc), severity="warning", timeout=8)
-        self.snapshot = await asyncio.to_thread(self.fw.snapshot)
+        await self._load_snapshot()
         self.notify("Базовые правила (loopback, established/related) применены")
+
+    def _pkts(self, rule: Rule) -> int:
+        return self._totals.get(rule.key, (rule.pkts, rule.bytes))[0]
+
+    async def _load_snapshot(self) -> None:
+        self.snapshot = await asyncio.to_thread(self.fw.snapshot)
+        self._totals = await asyncio.to_thread(self.fw.counter_totals, self.snapshot)
 
     def _visible(self) -> List[Rule]:
         return [r for r in self.snapshot.rules.get(self.current, []) if not r.hidden]
@@ -228,14 +238,14 @@ class LinFWApp(App):
         if same_layout:
             # only counters moved: update cells in place, cursor and scroll stay put
             for rule in rules:
-                for col, cell in zip(COLUMNS, row_cells(rule)):
+                for col, cell in zip(COLUMNS, row_cells(rule, self._pkts(rule))):
                     table.update_cell(rule.key, col, cell, update_width=True)
         else:
             cursor_key = self._selected_key()
             scroll = table.scroll_y
             table.clear()
             for rule in rules:
-                table.add_row(*row_cells(rule), key=rule.key)
+                table.add_row(*row_cells(rule, self._pkts(rule)), key=rule.key)
             target = cursor_key
             if wanted:
                 # wanted = (chain, visible number); if that rule is gone, take its closest neighbour
@@ -317,7 +327,7 @@ class LinFWApp(App):
                 self.notify(f"{done} · сохранено ({saved})")
                 ok = True
             try:
-                self.snapshot = await asyncio.to_thread(self.fw.snapshot)
+                await self._load_snapshot()
             except FirewallError as exc:
                 self.notify(str(exc), severity="error", timeout=8)
         self._render()

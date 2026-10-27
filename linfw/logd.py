@@ -1,20 +1,28 @@
-"""linfw-logd: records the packets that rules with logging on send to NFLOG.
+"""linfw-logd, the background service (`linfw --logd`, run by systemd).
 
-Run by systemd (`linfw --logd`). Appends one line per packet to HITS_FILE and
-rotates it at MAX_BYTES, keeping a single previous generation.
+It does two jobs that must not depend on the UI being open:
+  * records the packets that rules with logging on send to NFLOG, one file per
+    day, deleting files older than RETENTION_DAYS;
+  * samples the iptables counters every SAMPLE_SECONDS into the running totals
+    (see counters.py), and once more on shutdown, so no hits are lost to resets.
 """
 from __future__ import annotations
 
 import os
+import signal
 import sys
-from datetime import datetime
+import threading
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from . import nflog
-from .journal import HITS_FILE, LogEntry, format_hit
-from .model import LOG_GROUP, LOG_PREFIX
+from .counters import COUNTERS_FILE, CounterStore
+from .firewall import Firewall, SystemRunner
+from .journal import HITS_DIR, RETENTION_DAYS, LogEntry, day_file, format_hit, list_hit_files
+from .model import LOG_GROUP, LOG_PREFIX, FirewallError
 
-MAX_BYTES = 5 * 1024 * 1024
+SAMPLE_SECONDS = 5
+PRUNE_SECONDS = 3600
 
 
 def entry_from_packet(packet: nflog.Packet, now: Optional[datetime] = None) -> Optional[LogEntry]:
@@ -30,33 +38,94 @@ def entry_from_packet(packet: nflog.Packet, now: Optional[datetime] = None) -> O
 
 
 class HitWriter:
-    def __init__(self, path: str = HITS_FILE, max_bytes: int = MAX_BYTES) -> None:
-        self.path = path
-        self.max_bytes = max_bytes
-        os.makedirs(os.path.dirname(path), mode=0o750, exist_ok=True)
-        self._fh = open(path, "a", buffering=1)
+    """Appends records to the file of their day and keeps `keep_days` days of files."""
+
+    def __init__(self, directory: str = HITS_DIR, keep_days: int = RETENTION_DAYS) -> None:
+        self.directory = directory
+        self.keep_days = keep_days
+        self._day: Optional[str] = None
+        self._fh = None
+        self._lock = threading.Lock()
+        os.makedirs(directory, mode=0o750, exist_ok=True)
+        self.prune()
 
     def write(self, entry: LogEntry) -> None:
-        if self._fh.tell() >= self.max_bytes:
-            self._fh.close()
-            os.replace(self.path, self.path + ".1")
-            self._fh = open(self.path, "a", buffering=1)
-        self._fh.write(format_hit(entry) + "\n")
+        day = entry.time[:10]
+        with self._lock:
+            if day != self._day:
+                if self._fh:
+                    self._fh.close()
+                self._fh = open(day_file(self.directory, date.fromisoformat(day)), "a", buffering=1)
+                self._day = day
+            self._fh.write(format_hit(entry) + "\n")
+
+    def prune(self, today: Optional[date] = None) -> None:
+        """Delete files of days older than the retention period (and stale files of the first version)."""
+        cutoff = (today or date.today()) - timedelta(days=self.keep_days)
+        for path in list_hit_files(self.directory):
+            name = os.path.basename(path)
+            try:
+                if name.startswith("hits-"):
+                    old = date.fromisoformat(name[5:15]) < cutoff
+                else:
+                    old = datetime.fromtimestamp(os.path.getmtime(path)).date() < cutoff
+                if old:
+                    os.remove(path)
+            except (OSError, ValueError):
+                continue
 
     def close(self) -> None:
-        self._fh.close()
+        with self._lock:
+            if self._fh:
+                self._fh.close()
+                self._fh = None
 
 
-def run(path: str = HITS_FILE, group: int = LOG_GROUP) -> None:
-    writer = HitWriter(path)
+def _sample(fw: Firewall) -> None:
     try:
-        with nflog.Listener(group) as listener:
-            print(f"linfw-logd: listening on nflog group {group}, writing to {path}", flush=True)
-            for packet in listener.packets():
-                entry = entry_from_packet(packet)
-                if entry:
-                    writer.write(entry)
-    except OSError as exc:
+        fw.counter_totals(fw.snapshot())
+    except FirewallError as exc:
+        print(f"linfw-logd: не удалось прочитать счётчики: {exc}", file=sys.stderr, flush=True)
+
+
+def _sampler(fw: Firewall, writer: HitWriter, stop: threading.Event) -> None:
+    pruned = 0.0
+    while not stop.wait(SAMPLE_SECONDS):
+        _sample(fw)
+        pruned += SAMPLE_SECONDS
+        if pruned >= PRUNE_SECONDS:
+            writer.prune()
+            pruned = 0.0
+
+
+def _terminate(*_args) -> None:
+    raise SystemExit(0)
+
+
+def run(directory: str = HITS_DIR, group: int = LOG_GROUP, counters_path: str = COUNTERS_FILE) -> None:
+    try:
+        fw = Firewall(SystemRunner(), CounterStore(counters_path))
+    except FirewallError as exc:
         sys.exit(f"linfw-logd: {exc}")
+    writer = HitWriter(directory)
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, _terminate)
+    thread = threading.Thread(target=_sampler, args=(fw, writer, stop), daemon=True)
+    thread.start()
+    _sample(fw)
+    try:
+        try:
+            with nflog.Listener(group) as listener:
+                print(f"linfw-logd: nflog group {group} -> {directory}; counters every {SAMPLE_SECONDS}s", flush=True)
+                for packet in listener.packets():
+                    entry = entry_from_packet(packet)
+                    if entry:
+                        writer.write(entry)
+        except OSError as exc:
+            # the journal cannot work here, but the counters still must be kept
+            print(f"linfw-logd: журнал срабатываний недоступен: {exc}", file=sys.stderr, flush=True)
+            stop.wait()
     finally:
+        stop.set()
+        _sample(fw)  # last sample before the rules go away
         writer.close()

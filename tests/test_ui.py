@@ -234,14 +234,20 @@ async def test_journal_screen_filters_and_returns():
         assert isinstance(app.screen, JournalScreen)
 
         await pilot.click("#jf-OUTPUT")
-        await pilot.pause(0.4)
+        await pilot.pause()
+        await app.workers.wait_for_complete()  # the filter re-reads the journal in a worker
+        await pilot.pause()
         wanted = sum(e.chain == "OUTPUT" for e in runner.read_journal()[1])
         assert table.row_count == wanted
         assert {str(table.get_row_at(i)[1]) for i in range(table.row_count)} == {"output"}
         await pilot.press("right")  # -> FORWARD
         await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
         assert {str(table.get_row_at(i)[1]) for i in range(table.row_count)} <= {"forward"}
         await pilot.press("left", "left", "left")  # back to "Все"
+        await pilot.pause()
+        await app.workers.wait_for_complete()
         await pilot.pause()
         assert table.row_count >= total
 
@@ -271,7 +277,7 @@ async def test_journal_error_and_empty_states():
         status = str(app.screen.query_one("#jstatus").render())
         assert "Записей нет" in status
 
-        def broken():
+        def broken(chain=None):
             from linfw.model import FirewallError
             raise FirewallError("Журнал ядра недоступен: тест")
         runner.read_journal = broken
@@ -304,3 +310,26 @@ async def test_empty_journal_explains_why():
         runner.logd_state = lambda: "active"
         await app.screen._poll()
         assert "nfnetlink_log" in status()
+
+
+async def test_table_shows_running_totals_that_survive_a_kernel_reset():
+    from linfw.counters import CounterStore
+
+    runner = DemoRunner(sample=False, jitter=False)
+    runner.rules["INPUT"].append([1500, 90_000, ["-p", "tcp", "--dport", "22", "-j", "ACCEPT"]])
+    app = LinFWApp(Firewall(runner, CounterStore(None)))
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        table = app.query_one(DataTable)
+        pkts = lambda: str(table.get_row_at(0)[1])  # noqa: E731
+        assert pkts() == "1 500"  # exact number, not 1.5K
+
+        runner.rules["INPUT"][-1][0:2] = [0, 0]  # the kernel counter is zeroed (reboot, restore, iptables -Z)
+        await app.action_refresh_now()
+        await pilot.pause()
+        assert pkts() == "1 500"
+
+        runner.rules["INPUT"][-1][0:2] = [25, 2500]
+        await app.action_refresh_now()
+        await pilot.pause()
+        assert pkts() == "1 525"

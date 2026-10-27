@@ -352,6 +352,7 @@ def test_base_rules_check_ignores_log_twins(fw):
 # -- journal parsing -----------------------------------------------------------
 
 from linfw.journal import parse_line, parse_text  # noqa: E402
+import linfw.journal as journal_mod  # noqa: E402
 
 
 def test_parse_journal_line_variants():
@@ -366,15 +367,15 @@ def test_parse_journal_line_variants():
 
 
 def test_parse_text_keeps_order_and_limit():
-    lines = [f"2026-10-27T12:00:{i % 60:02d}+0000 h kernel: LINFW:INPUT:DROP: SRC=1.1.1.{i % 250} DST=2.2.2.2 PROTO=TCP DPT=22" for i in range(1500)]
+    n = journal_mod.MAX_ENTRIES + 500
+    lines = [f"2026-10-27T12:00:{i % 60:02d}+0000 h kernel: LINFW:INPUT:DROP: SRC=1.1.1.{i % 250} DST=2.2.2.2 PROTO=TCP DPT=22" for i in range(n)]
     lines.insert(3, "unrelated line")
     entries = parse_text("\n".join(lines))
-    assert len(entries) == 1000 and entries[-1].source == "1.1.1.%d" % (1499 % 250)
+    assert len(entries) == journal_mod.MAX_ENTRIES and entries[-1].source == "1.1.1.%d" % ((n - 1) % 250)
 
 
 # -- journal sources and diagnosis -----------------------------------------------
 
-import linfw.journal as journal_mod  # noqa: E402
 
 _HIT_LINE = "2026-10-27T12:00:01+0300 srv kernel: LINFW:INPUT:DROP: IN=eth0 OUT= SRC=1.2.3.4 DST=5.6.7.8 PROTO=TCP SPT=1 DPT=22"
 
@@ -382,7 +383,8 @@ _HIT_LINE = "2026-10-27T12:00:01+0300 srv kernel: LINFW:INPUT:DROP: IN=eth0 OUT=
 def test_empty_journalctl_falls_back_to_a_file_that_has_records(monkeypatch):
     monkeypatch.setattr(journal_mod.persist, "find_binary", lambda name: "/bin/" + name if name == "journalctl" else None)
     monkeypatch.setattr(journal_mod, "_run", lambda argv: "2026-10-27T12:00:00+0300 srv kernel: unrelated\n")
-    monkeypatch.setattr(journal_mod, "_tail", lambda path: _HIT_LINE if path == "/var/log/messages" else None)
+    monkeypatch.setattr(journal_mod, "HITS_DIR", "/nonexistent-linfw-dir")
+    monkeypatch.setattr(journal_mod, "_tail", lambda path, *a, **k: _HIT_LINE if path == "/var/log/messages" else None)
     source, entries = journal_mod.read_entries()
     assert source == "/var/log/messages" and entries[0].port == "22"
 
@@ -390,13 +392,15 @@ def test_empty_journalctl_falls_back_to_a_file_that_has_records(monkeypatch):
 def test_no_records_anywhere_reports_the_first_readable_source(monkeypatch):
     monkeypatch.setattr(journal_mod.persist, "find_binary", lambda name: "/bin/" + name if name == "journalctl" else None)
     monkeypatch.setattr(journal_mod, "_run", lambda argv: "")
-    monkeypatch.setattr(journal_mod, "_tail", lambda path: None)
+    monkeypatch.setattr(journal_mod, "HITS_DIR", "/nonexistent-linfw-dir")
+    monkeypatch.setattr(journal_mod, "_tail", lambda path, *a, **k: None)
     assert journal_mod.read_entries() == ("journalctl -k", [])
 
 
 def test_nothing_readable_is_an_error(monkeypatch):
     monkeypatch.setattr(journal_mod.persist, "find_binary", lambda name: None)
-    monkeypatch.setattr(journal_mod, "_tail", lambda path: None)
+    monkeypatch.setattr(journal_mod, "HITS_DIR", "/nonexistent-linfw-dir")
+    monkeypatch.setattr(journal_mod, "_tail", lambda path, *a, **k: None)
     with pytest.raises(FirewallError):
         journal_mod.read_entries()
 

@@ -1,5 +1,6 @@
+import os
 import struct
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 
@@ -72,29 +73,69 @@ def test_entry_from_packet_uses_the_prefix():
     assert entry_from_packet(nflog.Packet("LINFW:INPUT:DROP: ", b"junk")) is None
 
 
-def test_hit_writer_rotates_and_reader_round_trips(tmp_path):
-    path = str(tmp_path / "log" / "hits.log")
-    writer = HitWriter(path, max_bytes=200)
-    entries = [LogEntry(f"2026-10-27 12:00:{i:02d}", "INPUT", "drop", "tcp", f"1.1.1.{i}", "2.2.2.2", "22") for i in range(12)]
-    for e in entries:
-        writer.write(e)
+def hit(day, hms, chain="INPUT", src="1.1.1.1"):
+    return LogEntry(f"{day} {hms}", chain, "drop", "tcp", src, "2.2.2.2", "22")
+
+
+def test_writer_uses_one_file_per_day_and_prunes_after_30_days(tmp_path):
+    d = tmp_path / "hits"
+    d.mkdir()
+    for old in ("2026-09-01", "2026-09-26", "2026-09-27"):
+        (d / f"hits-{old}.log").write_text(format_hit(hit(old, "10:00:00")) + "\n")
+    (d / "hits.log").write_text("legacy\n")
+    os.utime(d / "hits.log", (0, 0))  # ancient legacy file
+    writer = HitWriter(str(d), keep_days=30)
+    writer.prune(today=date(2026, 10, 27))
+    assert sorted(p.name for p in d.iterdir()) == ["hits-2026-09-27.log"]  # exactly 30 days back survives
+    writer.write(hit("2026-10-27", "12:00:00"))
+    writer.write(hit("2026-10-27", "12:00:01", src="3.3.3.3"))
+    writer.write(hit("2026-10-28", "00:00:05"))
     writer.close()
-    old = (tmp_path / "log" / "hits.log.1").read_text()
-    new = (tmp_path / "log" / "hits.log").read_text()
-    assert old and new and len(new) < 300  # rotated at the limit
-    assert parse_hits(old + new)[-1] == entries[-1]
-    assert parse_hits(format_hit(entries[0]) + "\nbroken line\n") == [entries[0]]
+    assert len((d / "hits-2026-10-27.log").read_text().splitlines()) == 2
+    assert len((d / "hits-2026-10-28.log").read_text().splitlines()) == 1
 
 
-def test_journal_prefers_the_logd_file(tmp_path, monkeypatch):
+def test_reader_returns_newest_records_across_days_with_chain_filter(tmp_path):
+    from linfw.journal import read_hits
+
+    d = tmp_path / "hits"
+    d.mkdir()
+    for day in ("2026-10-25", "2026-10-26", "2026-10-27"):
+        lines = [format_hit(hit(day, f"10:00:{i:02d}", chain=("INPUT" if i % 2 else "OUTPUT"), src=f"9.9.{day[-2:]}.{i}")) for i in range(10)]
+        (d / f"hits-{day}.log").write_text("\n".join(lines) + "\n")
+    everything = read_hits(str(d), limit=100)
+    assert len(everything) == 30 and everything[0].time.startswith("2026-10-25") and everything[-1].time.startswith("2026-10-27")
+    newest = read_hits(str(d), limit=12)
+    assert len(newest) == 12 and newest[-1] == everything[-1] and newest[0] == everything[-12]
+    only_in = read_hits(str(d), chain="INPUT", limit=100)
+    assert len(only_in) == 15 and {e.chain for e in only_in} == {"INPUT"}
+    assert read_hits(str(tmp_path / "missing")) is None
+    assert read_hits(str(tmp_path)) == []  # a directory without record files
+
+
+def test_reader_skips_a_cut_first_line(tmp_path, monkeypatch):
     import linfw.journal as journal
 
-    hits = tmp_path / "hits.log"
-    hits.write_text(format_hit(LogEntry("2026-10-27 12:00:00", "INPUT", "drop", "tcp", "1.1.1.1", "2.2.2.2", "22")) + "\n")
-    monkeypatch.setattr(journal, "HITS_FILE", str(hits))
+    d = tmp_path / "hits"
+    d.mkdir()
+    lines = [format_hit(hit("2026-10-27", f"10:{i // 60:02d}:{i % 60:02d}")) for i in range(200)]
+    (d / "hits-2026-10-27.log").write_text("\n".join(lines) + "\n")
+    real_tail = journal._tail
+    monkeypatch.setattr(journal, "_tail", lambda path, nbytes=2_000_000, whole_lines=False: real_tail(path, 1000, whole_lines))
+    got = journal.read_hits(str(d), limit=1000)
+    assert got and all(len(format_hit(e).split("\t")) == 7 and e.time.startswith("2026-10-27 10:") for e in got)
+    assert got[-1].time == "2026-10-27 10:03:19"
+
+
+def test_journal_prefers_the_logd_files(tmp_path, monkeypatch):
+    import linfw.journal as journal
+
+    (tmp_path / "hits-2026-10-27.log").write_text(format_hit(hit("2026-10-27", "12:00:00")) + "\n")
+    monkeypatch.setattr(journal, "HITS_DIR", str(tmp_path))
     monkeypatch.setattr(journal.persist, "find_binary", lambda name: None)
     source, entries = journal.read_entries()
     assert source == "linfw-logd" and entries[0].source == "1.1.1.1"
+    assert journal.read_entries("OUTPUT") == ("linfw-logd", [])
 
 
 def test_legacy_log_twins_are_upgraded_to_nflog_keeping_counters():
