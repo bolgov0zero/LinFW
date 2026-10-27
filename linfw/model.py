@@ -16,12 +16,17 @@ OFF_PREFIX = "LINFW_OFF_"
 OFF_CHAINS = tuple(OFF_PREFIX + a for a in ACTIONS) + (OFF_PREFIX + "LOG",)
 
 # Logging: a rule with "write to the journal" is preceded by a hidden twin rule
-# with the same matches whose target is LOG (non-terminating: the packet goes on
-# to the real rule). The twin is rate-limited so a busy rule cannot flood the log.
+# with the same matches whose target is NFLOG (non-terminating: the packet goes on
+# to the real rule). NFLOG hands the packet to userspace over netlink, where the
+# linfw-logd service records it; unlike LOG it does not depend on the kernel ring
+# buffer, which containers cannot read. The twin is rate-limited so a busy rule
+# cannot flood the journal.
 LOG_TAG = "linfw:log"
-LOG_PREFIX = "LINFW"  # kernel log lines look like "LINFW:INPUT:DROP: IN=eth0 ... SRC=..."
+LOG_PREFIX = "LINFW"  # the packet prefix is "LINFW:<CHAIN>:<ACTION>: "
+LOG_GROUP = 40  # nflog group shared by the twin rules and linfw-logd
 LOG_RATE = "10/min"
 LOG_BURST = "10"
+LOG_TARGETS = ("LOG", "NFLOG")  # LOG is what earlier versions installed
 
 
 # Base rules: always on top of the chain, never shown in the table and never
@@ -38,6 +43,10 @@ BASE_RULES = {
 
 def log_prefix(chain: str, action: str) -> str:
     return f"{LOG_PREFIX}:{chain}:{action}: "
+
+
+def nflog_target(chain: str, action: str, prefix: Optional[str] = None) -> List[str]:
+    return ["-j", "NFLOG", "--nflog-group", str(LOG_GROUP), "--nflog-prefix", prefix or log_prefix(chain, action)]
 
 
 def base_ids(chain: str) -> List[str]:
@@ -167,7 +176,7 @@ class NewRule:
         spec = self.to_spec()[:-2] + ["-m", "comment", "--comment", LOG_TAG]
         spec += ["-m", "limit", "--limit", LOG_RATE, "--limit-burst", LOG_BURST]
         if enabled:
-            return spec + ["-j", "LOG", "--log-prefix", log_prefix(self.chain, self.action), "--log-level", "4"]
+            return spec + nflog_target(self.chain, self.action)
         return spec + ["-j", OFF_PREFIX + "LOG"]
 
 

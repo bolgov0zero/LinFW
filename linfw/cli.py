@@ -14,6 +14,7 @@ def main() -> None:
     parser.add_argument("--demo", action="store_true", help="работать с тестовыми правилами в памяти (без root и iptables)")
     parser.add_argument("--apply-base", action="store_true", help="поставить базовые правила (loopback, established/related) и сохранить")
     parser.add_argument("--remove-base", action="store_true", help="удалить базовые правила и сохранить")
+    parser.add_argument("--logd", action="store_true", help="служба журнала: принимает пакеты правил с журналом (запускается через systemd)")
     parser.add_argument("--version", action="version", version=f"linfw {__version__}")
     args = parser.parse_args()
 
@@ -35,6 +36,12 @@ def main() -> None:
             runner = SystemRunner()
         except FirewallError as exc:
             sys.exit(str(exc))
+
+    if args.logd:
+        from . import logd
+
+        logd.run()
+        return
 
     fw = Firewall(runner)
     if args.apply_base or args.remove_base:

@@ -35,6 +35,11 @@ fi
 
 if [ "${1:-}" = "--uninstall" ]; then
   [ -x "$PREFIX/bin/linfw" ] && { "$PREFIX/bin/linfw" --remove-base || warn "не удалось удалить базовые правила"; }
+  if command -v systemctl >/dev/null && [ -f /etc/systemd/system/linfw-logd.service ]; then
+    systemctl disable --now linfw-logd >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/linfw-logd.service
+    systemctl daemon-reload || true
+  fi
   rm -rf "$PREFIX"
   [ -L "$LINK" ] && rm -f "$LINK"
   say "LinFW удалён. Сохранённые правила iptables и пакеты автозагрузки не тронуты."
@@ -114,7 +119,31 @@ ln -sf "$PREFIX/bin/linfw" "$LINK"
 say "Применяю базовые правила (loopback, established/related)"
 "$PREFIX/bin/linfw" --apply-base || warn "не удалось применить базовые правила; LinFW повторит попытку при запуске"
 
-# --- 4. done ---------------------------------------------------------------
+# --- 4. journal service ----------------------------------------------------
+# linfw-logd records packets from rules that have logging on (iptables NFLOG target)
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null; then
+  say "Устанавливаю службу журнала linfw-logd"
+  cat > /etc/systemd/system/linfw-logd.service <<UNIT
+[Unit]
+Description=LinFW rule hit logger (iptables NFLOG)
+After=network.target
+
+[Service]
+ExecStart=$PREFIX/bin/linfw --logd
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable linfw-logd >/dev/null 2>&1 || warn "не удалось включить linfw-logd"
+  systemctl restart linfw-logd || warn "linfw-logd не запустился: journalctl -u linfw-logd"
+else
+  warn "systemd не найден: журнал срабатываний не будет работать. Службу запускают командой: linfw --logd"
+fi
+
+# --- 5. done ---------------------------------------------------------------
 say "Готово. Запуск: linfw"
 if [ -n "$PERSIST" ]; then
   say "Правила сохраняются автоматически (${PERSIST})."

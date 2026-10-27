@@ -24,6 +24,10 @@ _DMESG_T = re.compile(r"^\[\w{3} (\w{3}\s+\d{1,2} \d{2}:\d{2}:\d{2}) (\d{4})\]")
 
 _LOG_FILES = ("/var/log/kern.log", "/var/log/messages", "/var/log/syslog")
 
+# written by linfw-logd, one tab-separated record per line:
+#   time  chain  action  protocol  source  destination  port
+HITS_FILE = "/var/log/linfw/hits.log"
+
 
 @dataclass(frozen=True)
 class LogEntry:
@@ -72,6 +76,25 @@ def parse_text(text: str) -> List[LogEntry]:
     return entries[-MAX_ENTRIES:]
 
 
+def format_hit(e: LogEntry) -> str:
+    return "\t".join((e.time, e.chain, e.action, e.protocol, e.source, e.destination, e.port))
+
+
+def parse_hits(text: str) -> List[LogEntry]:
+    entries = []
+    for line in text.splitlines():
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) == 7:
+            entries.append(LogEntry(*parts))
+    return entries[-MAX_ENTRIES:]
+
+
+def _read_hits() -> Optional[str]:
+    """The rotated file first, so the text stays in chronological order."""
+    chunks = [t for t in (_tail(HITS_FILE + ".1"), _tail(HITS_FILE)) if t is not None]
+    return "".join(chunks) if chunks else None
+
+
 def _run(argv: List[str]) -> Optional[str]:
     try:
         r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=20)
@@ -90,21 +113,32 @@ def _tail(path: str, nbytes: int = 4_000_000) -> Optional[str]:
         return None
 
 
-def read_entries() -> Tuple[str, List[LogEntry]]:
-    """Return (source name, entries oldest-first) from the first readable source:
-    journald, a classic log file, then dmesg."""
+def _sources():
+    """Candidate (name, reader, parser) triples, most likely first. Readers return text or None."""
+    yield "linfw-logd", _read_hits, parse_hits
+    # the kernel log: where records of rules created by older versions (target LOG) went
     journalctl = persist.find_binary("journalctl")
     if journalctl:
-        text = _run([journalctl, "-k", "-o", "short-iso", "--no-pager", "-q", "-n", "20000"])
-        if text is not None:
-            return "journalctl -k", parse_text(text)
+        yield "journalctl -k", lambda: _run([journalctl, "-k", "-o", "short-iso", "--no-pager", "-q", "-n", "20000"]), parse_text
     for path in _LOG_FILES:
-        text = _tail(path)
-        if text is not None:
-            return path, parse_text(text)
+        yield path, lambda p=path: _tail(p), parse_text
     dmesg = persist.find_binary("dmesg")
     if dmesg:
-        text = _run([dmesg, "-T"])
-        if text is not None:
-            return "dmesg", parse_text(text)
-    raise FirewallError("Журнал ядра недоступен: не удалось прочитать journalctl, kern.log, messages, syslog и dmesg")
+        yield "dmesg", lambda: _run([dmesg, "-T"]), parse_text
+
+
+def read_entries() -> Tuple[str, List[LogEntry]]:
+    """Return (source name, entries oldest-first). Sources are tried in turn and
+    the first one that actually contains records wins."""
+    first_readable = ""
+    for name, read, parse in _sources():
+        text = read()
+        if text is None:
+            continue
+        entries = parse(text)
+        if entries:
+            return name, entries
+        first_readable = first_readable or name
+    if first_readable:
+        return first_readable, []
+    raise FirewallError("Журнал недоступен: нет файла службы linfw-logd и не читается журнал ядра")

@@ -202,6 +202,7 @@ class JournalScreen(Screen):
         self._entries: List[LogEntry] = []
         self._source = ""
         self._error = ""
+        self._why_empty = ""
         self._shown: Optional[List[LogEntry]] = None
 
     def compose(self) -> ComposeResult:
@@ -228,9 +229,34 @@ class JournalScreen(Screen):
         try:
             self._source, self._entries = await asyncio.to_thread(self.fw.read_journal)
             self._error = ""
+            self._why_empty = "" if self._entries else await self._explain_empty()
         except FirewallError as exc:
             self._error = str(exc)
         self._redraw()
+
+    async def _explain_empty(self) -> str:
+        """Tell the user why there is nothing to show instead of leaving a blank table."""
+        try:
+            rules, hits, state = await asyncio.to_thread(self.fw.log_diagnosis)
+        except FirewallError:
+            return "Записей нет."
+        if not rules:
+            return "Записей нет: журнал не включён ни у одного правила. Включите «Journal» в окне правила (F1 / e)."
+        if not hits:
+            return (
+                f"Записей нет: правил с журналом {rules}, но они ещё ни разу не сработали (0 пакетов). "
+                "Проверьте порядок правил и счётчик Pkts: пакет должен дойти до правила."
+            )
+        head = f"Записей нет, хотя правила сработали ({hits} пакетов): "
+        if state not in (None, "active"):
+            return (
+                head + f"служба linfw-logd не работает (состояние: {state}). "
+                "Запустите: systemctl enable --now linfw-logd; причина: journalctl -u linfw-logd"
+            )
+        return (
+            head + "служба linfw-logd ничего не записала. Проверьте journalctl -u linfw-logd: "
+            "возможно, не загружен модуль nfnetlink_log (в контейнере его загружают на хосте: modprobe nfnetlink_log)."
+        )
 
     def _mark_filter(self) -> None:
         for chain in FILTERS:
@@ -260,9 +286,7 @@ class JournalScreen(Screen):
         if self._error:
             status.update(Text(self._error, style="bold #ff5555"))
         elif not self._entries:
-            status.update(
-                "Записей нет. Включите «Journal» в окне правила (F1 / e): запись появится, когда правило сработает."
-            )
+            status.update(self._why_empty or "Записей нет.")
         else:
             status.update(
                 f"Источник: {self._source}  ·  показано {len(shown)} из {len(self._entries)}"

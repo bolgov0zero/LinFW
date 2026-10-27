@@ -106,7 +106,7 @@ class LinFWApp(App):
     #jbar .spacer { width: 1fr; }
     #jbar Button.active { background: $accent; color: $text; text-style: bold; }
     #jtable { height: 1fr; }
-    #jstatus { height: 1; padding: 0 1; background: $panel-darken-1; }
+    #jstatus { height: auto; min-height: 1; padding: 0 1; background: $panel-darken-1; }
     .buttons { height: 1; align-horizontal: center; }
     .buttons Button { min-width: 0; height: 1; border: none; padding: 0 2; margin: 0 1; }
     .dialog OptionList { height: auto; max-height: 10; border: tall $primary; }

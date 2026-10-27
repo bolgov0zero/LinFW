@@ -127,6 +127,9 @@ class DemoRunner:
                 self._add_hit(datetime.now())
         return "demo", list(self._hits)
 
+    def logd_state(self) -> Optional[str]:
+        return "active"
+
     def persist(self) -> str:
         self.persist_calls += 1
         return "demo (не сохраняется)"

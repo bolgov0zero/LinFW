@@ -15,7 +15,7 @@ from .model import (
     Rule,
     base_ids,
     base_specs,
-    log_prefix,
+    nflog_target,
 )
 from .parser import Snapshot, parse_save
 
@@ -53,6 +53,17 @@ class SystemRunner:
     def read_journal(self) -> Tuple[str, List[LogEntry]]:
         return journal.read_entries()
 
+    def logd_state(self) -> Optional[str]:
+        """systemd's view of linfw-logd ("active", "inactive", "failed" ...), None without systemd."""
+        systemctl = persist.find_binary("systemctl")
+        if not systemctl:
+            return None
+        try:
+            r = subprocess.run([systemctl, "is-active", "linfw-logd"], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.stdout.strip() or "unknown"
+
 
 class Firewall:
     """Rule operations. Every mutation re-reads the chain first and refuses to
@@ -76,6 +87,13 @@ class Firewall:
 
     def read_journal(self) -> Tuple[str, List[LogEntry]]:
         return self.runner.read_journal()
+
+    def log_diagnosis(self) -> Tuple[int, int, Optional[str]]:
+        """(rules with logging on, packets their twins have sent to the log, state of
+        linfw-logd). Packets > 0 with an empty journal means the service is not
+        recording; packets == 0 means the rules simply have not matched."""
+        twins = [r for rules in self.snapshot().rules.values() for r in rules if r.is_log]
+        return len(twins), sum(r.pkts for r in twins), self.runner.logd_state()
 
     # -- rule operations -------------------------------------------------
 
@@ -181,15 +199,39 @@ class Firewall:
             r.base_id for r in rules[len(want):]
         )
 
+    @staticmethod
+    def _legacy_twins(snap: Snapshot) -> List[Rule]:
+        """Twins made by earlier versions with the LOG target (kernel log), now replaced by NFLOG."""
+        return [
+            r
+            for rules in snap.rules.values()
+            for r in rules
+            if r.is_log and any(tok == "-j" and r.spec[i + 1] == "LOG" for i, tok in enumerate(r.spec[:-1]))
+        ]
+
     def base_ok(self, snap: Snapshot) -> bool:
-        return all(self._chain_base_ok(c, snap.rules[c]) for c in CHAINS)
+        return all(self._chain_base_ok(c, snap.rules[c]) for c in CHAINS) and not self._legacy_twins(snap)
+
+    def _upgrade_legacy_twins(self, snap: Snapshot) -> bool:
+        legacy = self._legacy_twins(snap)
+        for twin in legacy:
+            spec = list(twin.spec)
+            j = self._target_index(spec)
+            options = spec[j + 2:]
+            prefix = options[options.index("--log-prefix") + 1] if "--log-prefix" in options else None
+            spec = spec[:j] + nflog_target(twin.chain, "", prefix)
+            self.runner.ipt(["-R", twin.chain, str(twin.index), *spec, "-c", str(twin.pkts), str(twin.bytes)])
+        return bool(legacy)
 
     def ensure_base(self) -> bool:
         """Put the base rules (loopback, established/related) at the top of every
-        chain. Returns True if anything had to be changed. New copies go in
-        before stale ones are removed, so traffic is never left unprotected."""
+        chain, and move logging twins from the old LOG target to NFLOG. Returns
+        True if anything had to be changed. New copies go in before stale ones are
+        removed, so traffic is never left unprotected."""
         snap = self.snapshot()
-        changed = False
+        changed = self._upgrade_legacy_twins(snap)
+        if changed:
+            snap = self.snapshot()
         for chain in CHAINS:
             if self._chain_base_ok(chain, snap.rules[chain]):
                 continue
@@ -239,18 +281,11 @@ class Firewall:
 
     def _twin_spec(self, twin: Rule, chain: str, action: str, on: bool) -> List[str]:
         spec = list(twin.spec)
-        for opt in ("--log-prefix", "--log-level"):  # only valid with the LOG target
-            while opt in spec:
-                k = spec.index(opt)
-                del spec[k:k + 2]
         j = self._target_index(spec)
-        del spec[j + 2:]
+        del spec[j:]  # drop the target together with its own options
         if on:
-            spec[j + 1] = "LOG"
-            spec += ["--log-prefix", log_prefix(chain, action), "--log-level", "4"]
-        else:
-            spec[j + 1] = OFF_PREFIX + "LOG"
-        return spec
+            return spec + nflog_target(chain, action)
+        return spec + ["-j", OFF_PREFIX + "LOG"]
 
     def _current(self, rule: Rule) -> List[Rule]:
         rules = self.snapshot().rules[rule.chain]

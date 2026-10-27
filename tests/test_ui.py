@@ -3,6 +3,7 @@ from textual.widgets import DataTable, Input, RadioSet, Tabs
 from linfw.app import LinFWApp
 from linfw.demo import DemoRunner
 from linfw.firewall import Firewall
+from linfw.model import NewRule
 from linfw.screens import AddRuleScreen, ConfirmScreen, TemplateScreen
 
 
@@ -203,7 +204,7 @@ async def test_log_checkbox_creates_a_logged_rule_and_marks_the_row():
         app.screen.query_one("#log", Checkbox).value = True
         await pilot.click("#save")
         await pilot.pause(0.5)
-        assert any("LOG" in t for _, _, t in runner.rules["INPUT"])
+        assert any("NFLOG" in t for _, _, t in runner.rules["INPUT"])
         table = app.query_one(DataTable)
         last = [str(c) for c in table.get_row_at(table.row_count - 1)]
         assert last[-1] == "accept ●" and last[6] == "9999"
@@ -276,3 +277,30 @@ async def test_journal_error_and_empty_states():
         runner.read_journal = broken
         await app.screen._poll()
         assert "недоступен" in str(app.screen.query_one("#jstatus").render())
+
+
+async def test_empty_journal_explains_why():
+    runner = DemoRunner(sample=False, jitter=False)
+    fw = Firewall(runner)
+    app = LinFWApp(fw)
+    async with app.run_test(size=(140, 36)) as pilot:
+        await pilot.pause()
+        status = lambda: str(app.screen.query_one("#jstatus").render())  # noqa: E731
+        await pilot.press("f7")
+        await pilot.pause(0.5)
+        assert "не включён ни у одного правила" in status()
+
+        fw.add(NewRule("INPUT", "tcp", "DROP", port="22", log=True))
+        await app.screen._poll()
+        assert "ещё ни разу не сработали" in status()
+
+        for entry in runner.rules["INPUT"]:
+            if "NFLOG" in entry[2]:
+                entry[0] = 3
+        runner.logd_state = lambda: "failed"
+        await app.screen._poll()
+        text = status()
+        assert "правила сработали (3 пакетов)" in text and "состояние: failed" in text and "linfw-logd" in text
+        runner.logd_state = lambda: "active"
+        await app.screen._poll()
+        assert "nfnetlink_log" in status()

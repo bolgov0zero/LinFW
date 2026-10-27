@@ -257,7 +257,7 @@ def test_add_with_log_creates_hidden_twin(fw):
     main, twin = rules[-1], rules[-2]
     assert twin.is_log and twin.hidden and not main.hidden
     assert main.log and main.port == "2222" and main.number == before + 1
-    assert twin.spec[-6:-4] == ("-j", "LOG") and "LINFW:INPUT:DROP: " in twin.spec
+    assert twin.spec[-6:] == ("-j", "NFLOG", "--nflog-group", "40", "--nflog-prefix", "LINFW:INPUT:DROP: ")
     assert "limit" in twin.spec  # rate-limited
     assert len(visible(fw)) == before + 1  # the twin is not listed
     assert not visible(fw)[0].log  # default: off
@@ -329,11 +329,11 @@ def test_toggle_disables_the_twin_too(fw):
     rules = fw.snapshot().rules["INPUT"]
     twin, off = rules[-2], rules[-1]
     assert not off.enabled and not twin.enabled
-    assert twin.spec[-2:] == ("-j", "LINFW_OFF_LOG") and "--log-prefix" not in twin.spec
+    assert twin.spec[-2:] == ("-j", "LINFW_OFF_LOG") and "--nflog-prefix" not in twin.spec
     assert off.log  # still flagged
     assert fw.toggle(off) is True
     rules = fw.snapshot().rules["INPUT"]
-    assert rules[-1].enabled and rules[-2].spec[-6:] == ("-j", "LOG", "--log-prefix", "LINFW:INPUT:DROP: ", "--log-level", "4")
+    assert rules[-1].enabled and rules[-2].spec[-6:] == ("-j", "NFLOG", "--nflog-group", "40", "--nflog-prefix", "LINFW:INPUT:DROP: ")
 
 
 def test_twins_cannot_be_touched_directly(fw):
@@ -370,3 +370,46 @@ def test_parse_text_keeps_order_and_limit():
     lines.insert(3, "unrelated line")
     entries = parse_text("\n".join(lines))
     assert len(entries) == 1000 and entries[-1].source == "1.1.1.%d" % (1499 % 250)
+
+
+# -- journal sources and diagnosis -----------------------------------------------
+
+import linfw.journal as journal_mod  # noqa: E402
+
+_HIT_LINE = "2026-10-27T12:00:01+0300 srv kernel: LINFW:INPUT:DROP: IN=eth0 OUT= SRC=1.2.3.4 DST=5.6.7.8 PROTO=TCP SPT=1 DPT=22"
+
+
+def test_empty_journalctl_falls_back_to_a_file_that_has_records(monkeypatch):
+    monkeypatch.setattr(journal_mod.persist, "find_binary", lambda name: "/bin/" + name if name == "journalctl" else None)
+    monkeypatch.setattr(journal_mod, "_run", lambda argv: "2026-10-27T12:00:00+0300 srv kernel: unrelated\n")
+    monkeypatch.setattr(journal_mod, "_tail", lambda path: _HIT_LINE if path == "/var/log/messages" else None)
+    source, entries = journal_mod.read_entries()
+    assert source == "/var/log/messages" and entries[0].port == "22"
+
+
+def test_no_records_anywhere_reports_the_first_readable_source(monkeypatch):
+    monkeypatch.setattr(journal_mod.persist, "find_binary", lambda name: "/bin/" + name if name == "journalctl" else None)
+    monkeypatch.setattr(journal_mod, "_run", lambda argv: "")
+    monkeypatch.setattr(journal_mod, "_tail", lambda path: None)
+    assert journal_mod.read_entries() == ("journalctl -k", [])
+
+
+def test_nothing_readable_is_an_error(monkeypatch):
+    monkeypatch.setattr(journal_mod.persist, "find_binary", lambda name: None)
+    monkeypatch.setattr(journal_mod, "_tail", lambda path: None)
+    with pytest.raises(FirewallError):
+        journal_mod.read_entries()
+
+
+def test_log_diagnosis_counts_twins_and_their_packets():
+    runner = DemoRunner(sample=False, jitter=False)
+    fw = Firewall(runner)
+    assert fw.log_diagnosis() == (0, 0, "active")
+    fw.add(NewRule("INPUT", "tcp", "DROP", port="22", log=True))
+    fw.add(NewRule("OUTPUT", "tcp", "DROP", port="25", log=True))
+    assert fw.log_diagnosis()[:2] == (2, 0)
+    for chain in runner.rules.values():
+        for entry in chain:
+            if "NFLOG" in entry[2]:
+                entry[0] = 4
+    assert fw.log_diagnosis()[:2] == (2, 8)
