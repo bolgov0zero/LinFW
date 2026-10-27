@@ -101,7 +101,10 @@ if [ -n "$SELF" ] && [ -f "$SELF" ]; then
   [ -f "$HERE/pyproject.toml" ] && SRC="$HERE"
 fi
 [ -n "$SRC" ] || SRC="https://github.com/${REPO}/archive/refs/heads/${REF}.tar.gz"
-"$PREFIX/bin/pip" install --quiet --upgrade "$SRC"
+"$PREFIX/bin/pip" install --quiet --upgrade --no-cache-dir "$SRC"
+# the package version does not change between commits, so pip would skip an
+# update above: force-reinstall LinFW itself (dependencies are already in place)
+"$PREFIX/bin/pip" install --quiet --force-reinstall --no-deps --no-cache-dir "$SRC"
 
 ln -sf "$PREFIX/bin/linfw" "$LINK"
 
