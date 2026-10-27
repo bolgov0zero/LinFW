@@ -113,3 +113,19 @@ async def test_mouse_click_button_and_cancel():
         await pilot.pause()
         assert not isinstance(app.screen, AddRuleScreen)
         assert runner.persist_calls == 0
+
+
+async def test_switching_to_an_empty_chain_clears_the_table():
+    runner = DemoRunner(sample=False, jitter=False)
+    runner.rules["INPUT"].append([0, 0, ["-p", "tcp", "--dport", "22", "-j", "ACCEPT"]])
+    app = LinFWApp(Firewall(runner))
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        table = app.query_one(DataTable)
+        assert table.row_count == 1  # ALL
+        await pilot.press("right", "right")  # OUTPUT: no rules
+        await pilot.pause()
+        assert table.row_count == 0
+        await pilot.press("left")  # INPUT
+        await pilot.pause()
+        assert table.row_count == 1

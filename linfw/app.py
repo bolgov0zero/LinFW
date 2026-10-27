@@ -116,7 +116,8 @@ class LinFWApp(App):
         self.fw = firewall
         self.snapshot = Snapshot()
         self.current = "ALL"
-        self._shown: List[Rule] = []
+        # None = the table no longer matches what was drawn last (e.g. after a tab switch): redraw
+        self._shown: Optional[List[Rule]] = None
         self._select: Optional[Tuple[str, int]] = None
         self._lock = asyncio.Lock()
         self._persist_note = ""
@@ -181,9 +182,9 @@ class LinFWApp(App):
     def _render(self) -> None:
         table = self.table
         rules = self._visible()
-        old_keys = [r.key for r in self._shown]
+        old_keys = [r.key for r in self._shown or []]
         new_keys = [r.key for r in rules]
-        same_layout = old_keys == new_keys and all(
+        same_layout = self._shown is not None and old_keys == new_keys and all(
             a.spec == b.spec and a.enabled == b.enabled for a, b in zip(self._shown, rules)
         )
         wanted = self._select
@@ -244,7 +245,7 @@ class LinFWApp(App):
         name = (event.tab.id or "tab-ALL")[4:]
         if name != self.current:
             self.current = name
-            self._shown = []
+            self._shown = None
             self._render()
         self.table.focus()
 
@@ -309,7 +310,7 @@ class LinFWApp(App):
         for rule in self.snapshot.rules.get(new.chain, []):
             if rule.spec == spec or rule.spec[: len(spec)] == spec:
                 self._select = (rule.chain, rule.index)
-                self._shown = []
+                self._shown = None
                 self._render()
                 return
 
@@ -329,7 +330,7 @@ class LinFWApp(App):
         index = max(rule.index - 1, 1)
         if await self._apply("Правило удалено", lambda: self.fw.delete(rule)):
             self._select = (rule.chain, index)
-            self._shown = []
+            self._shown = None
             self._render()
 
     @on(Button.Pressed, "#btn-up")
@@ -353,7 +354,7 @@ class LinFWApp(App):
 
         if await self._apply("Правило перемещено", op) and moved and moved[0]:
             self._select = (rule.chain, rule.index + delta)
-            self._shown = []
+            self._shown = None
             self._render()
 
     @on(Button.Pressed, "#btn-toggle")
