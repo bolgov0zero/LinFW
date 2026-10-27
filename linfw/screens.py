@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from rich.text import Text
 from textual import on
@@ -9,11 +9,12 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Checkbox, DataTable, Input, Label, OptionList, RadioButton, RadioSet, Static
+from textual.widgets import Button, Checkbox, DataTable, Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
 from .journal import MAX_ENTRIES, RETENTION_DAYS, LogEntry
 from .model import ACTIONS, CHAINS, PROTOCOLS, FirewallError, NewRule, Rule
+from .widgets import Segmented
 
 ACTION_STYLE = {"accept": "bold #2ecc71", "drop": "bold #ff5555", "reject": "bold #ff9f1a"}
 
@@ -21,24 +22,37 @@ ACTION_STYLE = {"accept": "bold #2ecc71", "drop": "bold #ff5555", "reject": "bol
 class ToolButton(Button, can_focus=False):
     """Toolbar buttons never steal focus, so the arrow keys keep driving the table."""
 
+
 TEMPLATES = [
     ("Открыть для всех SSH (порт 22)", NewRule("INPUT", "tcp", "ACCEPT", port="22")),
     ("Открыть для всех ICMP", NewRule("INPUT", "icmp", "ACCEPT")),
     ("Открыть для всех HTTP/HTTPS (порты 80, 443)", NewRule("INPUT", "tcp", "ACCEPT", port="80,443")),
 ]
 
+# the selected action segment takes the action's colour, as in the rules table
+ACTION_SEGMENT = {
+    "ACCEPT": "bold #0b1f10 on #3fb950",
+    "DROP": "bold #2b0a08 on #f85149",
+    "REJECT": "bold #2b1405 on #f0883e",
+}
 
-def _choice(label: str, name: str, values: List[str], selected: str, disabled: bool = False) -> ComposeResult:
-    with Horizontal(classes="row"):
+
+def _choice(
+    label: str,
+    name: str,
+    options: List[Tuple[str, str]],
+    selected: str,
+    disabled: bool = False,
+    styles_by_value: Optional[Dict[str, str]] = None,
+    classes: str = "row",
+) -> ComposeResult:
+    with Horizontal(classes=classes):
         yield Label(label, classes="label")
-        with RadioSet(id=name, disabled=disabled):
-            for v in values:
-                yield RadioButton(v.lower() if name == "action" else v, value=(v == selected), name=v)
+        yield Segmented(options, selected, id=name, disabled=disabled, styles_by_value=styles_by_value)
 
 
 def _picked(dialog: ModalScreen, name: str) -> str:
-    button = dialog.query_one(f"#{name}", RadioSet).pressed_button
-    return button.name if button and button.name else ""
+    return dialog.query_one(f"#{name}", Segmented).value
 
 
 class AddRuleScreen(ModalScreen[Optional[NewRule]]):
@@ -54,9 +68,16 @@ class AddRuleScreen(ModalScreen[Optional[NewRule]]):
         with Vertical(classes="dialog"):
             yield Label("Редактировать правило" if self._rule else "Добавить правило", classes="title")
             # a rule cannot change chain in place
-            yield from _choice("Chain", "chain", list(CHAINS), init.chain, disabled=self._rule is not None)
-            yield from _choice("Protocol", "protocol", list(PROTOCOLS), init.protocol)
-            yield from _choice("Action", "action", list(ACTIONS), init.action)
+            yield from _choice("Chain", "chain", [(c, c) for c in CHAINS], init.chain, disabled=self._rule is not None)
+            yield from _choice("Protocol", "protocol", [(p, p) for p in PROTOCOLS], init.protocol)
+            yield from _choice(
+                "Action",
+                "action",
+                [(a, a.lower()) for a in ACTIONS],
+                init.action,
+                styles_by_value=ACTION_SEGMENT,
+                classes="row gap",
+            )
             with Horizontal(classes="row"):
                 yield Label("Source", classes="label")
                 yield Input(init.source, placeholder="any или 192.168.1.0/24", id="source")
@@ -80,9 +101,10 @@ class AddRuleScreen(ModalScreen[Optional[NewRule]]):
                 yield Button("Отмена", id="cancel")
 
     def on_mount(self) -> None:
+        self.query_one("#error", Label).display = False
         self.query_one("#source", Input).focus()
 
-    @on(RadioSet.Changed, "#protocol")
+    @on(Segmented.Changed, "#protocol")
     def _protocol_changed(self) -> None:
         port = self.query_one("#port", Input)
         port.disabled = _picked(self, "protocol") not in ("tcp", "udp")
@@ -104,10 +126,12 @@ class AddRuleScreen(ModalScreen[Optional[NewRule]]):
             self.query_one("#port", Input).value,
             self.query_one("#log", Checkbox).value,
         )
+        error = self.query_one("#error", Label)
         try:
             rule = raw.validated()
         except ValueError as exc:
-            self.query_one("#error", Label).update(str(exc))
+            error.update(str(exc))
+            error.display = True
             return
         self.dismiss(rule)
 
@@ -116,23 +140,44 @@ class AddRuleScreen(ModalScreen[Optional[NewRule]]):
         self.dismiss(None)
 
 
+def _template_prompt(name: str, rule: NewRule, width: int) -> Text:
+    """`name   tcp · 22 · accept`, with the action in its colour (the chain only if it is not INPUT)."""
+    action = rule.action.lower()
+    where = "" if rule.chain == "INPUT" else f"{rule.chain.lower()} · "
+    return Text.assemble(
+        name.ljust(width),
+        "   ",
+        (f"{where}{rule.protocol} · {rule.port or '-'} · ", "dim"),
+        (action, ACTION_STYLE.get(action, "bold")),
+    )
+
+
 class TemplateScreen(ModalScreen[Optional[NewRule]]):
     BINDINGS = [Binding("escape", "cancel", "Отмена")]
 
     def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog"):
+        width = max(len(name) for name, _ in TEMPLATES)
+        with Vertical(classes="dialog wide"):
             yield Label("Шаблоны правил", classes="title")
-            yield OptionList(*[Option(name, id=str(i)) for i, (name, _) in enumerate(TEMPLATES)])
-            yield Label("Enter или клик — добавить правило", classes="hint")
+            yield OptionList(*[Option(_template_prompt(n, r, width), id=str(i)) for i, (n, r) in enumerate(TEMPLATES)])
+            yield Label("↑↓ выбрать · Enter или клик по пункту — добавить", classes="hint")
             with Horizontal(classes="buttons"):
+                yield Button("Добавить", variant="success", id="apply")
                 yield Button("Отмена", id="cancel")
 
     def on_mount(self) -> None:
-        self.query_one(OptionList).focus()
+        options = self.query_one(OptionList)
+        options.highlighted = 0
+        options.focus()
 
     @on(OptionList.OptionSelected)
     def _selected(self, event: OptionList.OptionSelected) -> None:
         self.dismiss(TEMPLATES[event.option_index][1])
+
+    @on(Button.Pressed, "#apply")
+    def _apply(self) -> None:
+        index = self.query_one(OptionList).highlighted
+        self.dismiss(TEMPLATES[index or 0][1])
 
     @on(Button.Pressed, "#cancel")
     def action_cancel(self) -> None:

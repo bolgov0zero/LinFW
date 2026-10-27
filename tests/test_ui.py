@@ -1,10 +1,11 @@
-from textual.widgets import DataTable, Input, RadioSet, Tabs
+from textual.widgets import DataTable, Input, Tabs
 
 from linfw.app import LinFWApp
 from linfw.demo import DemoRunner
 from linfw.firewall import Firewall
 from linfw.model import NewRule
 from linfw.screens import AddRuleScreen, ConfirmScreen, TemplateScreen
+from linfw.widgets import Segmented
 
 
 def make_app():
@@ -84,8 +85,8 @@ async def test_add_dialog_and_validation():
 
         port = app.screen.query_one("#port", Input)
         assert port.disabled
-        app.screen.query_one("#protocol", RadioSet).query("RadioButton").last().toggle()  # icmp
-        app.screen.query_one("#protocol", RadioSet).query("RadioButton")[1].toggle()  # tcp
+        app.screen.query_one("#protocol", Segmented).value = "icmp"
+        app.screen.query_one("#protocol", Segmented).value = "tcp"
         await pilot.pause()
         assert not port.disabled
         port.value = "99999"
@@ -157,7 +158,7 @@ async def test_double_click_and_enter_open_the_editor():
         assert isinstance(app.screen, AddRuleScreen)
         assert table.cursor_row == 1
         assert app.screen.query_one("#port", Input).value == "80,443"
-        assert app.screen.query_one("#chain", RadioSet).disabled
+        assert app.screen.query_one("#chain", Segmented).disabled
         app.screen.query_one("#port", Input).value = "8443"
         await pilot.click("#save")
         await pilot.pause(0.4)
@@ -198,7 +199,7 @@ async def test_log_checkbox_creates_a_logged_rule_and_marks_the_row():
         await pilot.press("f1")
         await pilot.pause()
         assert app.screen.query_one("#log", Checkbox).value is False  # off by default
-        app.screen.query_one("#protocol", RadioSet).query("RadioButton")[1].toggle()  # tcp
+        app.screen.query_one("#protocol", Segmented).value = "tcp"
         await pilot.pause()
         app.screen.query_one("#port", Input).value = "9999"
         app.screen.query_one("#log", Checkbox).value = True
@@ -333,3 +334,69 @@ async def test_table_shows_running_totals_that_survive_a_kernel_reset():
         await app.action_refresh_now()
         await pilot.pause()
         assert pkts() == "1 525"
+
+
+async def test_exit_button_closes_the_app():
+    app, _ = make_app()
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        buttons = [str(b.label) for b in app.query("#toolbar Button")]
+        assert buttons[-2:] == ["F7 Журнал", "F10 Выход"]  # the exit button sits right of the journal
+        await pilot.click("#btn-quit")
+        await pilot.pause(0.5)
+        assert not app.is_running
+
+
+async def test_segments_work_by_click_and_arrow_keys():
+    app, _ = make_app()
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        await pilot.press("f1")
+        await pilot.pause()
+        proto = app.screen.query_one("#protocol", Segmented)
+        port = app.screen.query_one("#port", Input)
+        assert proto.value == "all" and port.disabled
+
+        await pilot.click("#protocol", offset=(8, 0))  # the second segment: " tcp "
+        await pilot.pause()
+        assert proto.value == "tcp" and not port.disabled
+        proto.focus()
+        await pilot.press("right", "right")
+        await pilot.pause()
+        assert proto.value == "icmp" and port.disabled  # port is for tcp/udp only
+        await pilot.press("right", "right")
+        assert proto.value == "icmp"  # stops at the end
+        await pilot.press("left", "left", "left", "left")
+        await pilot.pause()
+        assert proto.value == "all"
+
+        action = app.screen.query_one("#action", Segmented)
+        action.value = "DROP"
+        await pilot.click("#save")
+        await pilot.pause(0.5)
+        assert runner_rules_has_drop_all(app)
+
+
+def runner_rules_has_drop_all(app):
+    return any(t == ["-j", "DROP"] for _, _, t in app.fw.runner.rules["INPUT"])
+
+
+async def test_template_dialog_button_and_click():
+    app, runner = make_app()
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        await pilot.press("f3")
+        await pilot.pause()
+        options = app.screen.query("OptionList").first()
+        assert options.highlighted == 0
+        await pilot.press("down")  # ICMP
+        await pilot.click("#apply")
+        await pilot.pause(0.5)
+        assert not isinstance(app.screen, TemplateScreen)
+        assert any(t[:2] == ["-p", "icmp"] for _, _, t in runner.rules["INPUT"])
+
+        await pilot.press("f3")
+        await pilot.pause()
+        await pilot.click("#cancel")
+        await pilot.pause(0.4)
+        assert not isinstance(app.screen, TemplateScreen)

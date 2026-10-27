@@ -77,7 +77,7 @@ class LinFWApp(App):
     CSS = """
     Screen { background: $surface; }
     #toolbar { height: 1; padding: 0 1; background: $panel; }
-    #toolbar Button { min-width: 0; height: 1; border: none; padding: 0 1; margin-right: 1; }
+    #toolbar Button { min-width: 0; height: 1; border: none; padding: 0; margin-right: 1; }
     #chains { height: 2; }
     #rules { height: 1fr; }
     DataTable { background: $surface; }
@@ -88,30 +88,31 @@ class LinFWApp(App):
 
     ModalScreen { align: center middle; }
     .dialog {
-        width: 72; max-width: 96%; height: auto; padding: 1 2;
-        border: thick $accent; background: $panel;
+        width: 70; max-width: 96%; height: auto; padding: 1 2;
+        border: round $panel-lighten-3; background: $panel;
     }
+    .dialog.wide { width: 86; }
     .title { text-style: bold; width: 100%; content-align: center middle; margin-bottom: 1; }
-    .hint { color: $text-muted; margin: 1 0; }
-    .row { height: auto; }
-    .label { width: 14; }
+    .hint { color: $text-muted; margin: 1 0 0 0; }
+    .row { height: 1; }
+    .row.gap { margin-bottom: 1; }
+    .label { width: 14; color: $text-muted; }
     .row Input { width: 1fr; height: 1; border: none; padding: 0 1; background: $boost; }
     .row Input:focus { background: $primary 40%; }
     .row Input:disabled { opacity: 0.4; }
     .row Checkbox { width: 1fr; height: 1; border: none; padding: 0; background: transparent; }
     .row Checkbox:focus { background: $primary 40%; }
-    .row RadioSet { layout: horizontal; width: 1fr; height: auto; border: none; padding: 0; background: transparent; }
-    .row RadioButton { width: auto; padding: 0 2 0 0; background: transparent; }
-    #error { color: $error; height: auto; margin: 1 0; }
+    #error { color: $error; height: auto; margin: 1 0 0 0; }
     #jbar { height: 1; padding: 0 1; background: $panel; }
     #jbar Button { min-width: 0; height: 1; border: none; padding: 0 2; margin-right: 1; }
     #jbar .spacer { width: 1fr; }
     #jbar Button.active { background: $accent; color: $text; text-style: bold; }
     #jtable { height: 1fr; }
     #jstatus { height: auto; min-height: 1; padding: 0 1; background: $panel-darken-1; }
-    .buttons { height: 1; align-horizontal: center; }
-    .buttons Button { min-width: 0; height: 1; border: none; padding: 0 2; margin: 0 1; }
-    .dialog OptionList { height: auto; max-height: 10; border: tall $primary; }
+    .buttons { height: 1; align-horizontal: right; margin-top: 1; }
+    .buttons Button { min-width: 0; height: 1; border: none; padding: 0 2; margin: 0 0 0 1; }
+    .dialog OptionList { height: auto; max-height: 10; border: round $panel-lighten-3; background: $boost; padding: 0 1; }
+    .dialog OptionList:focus { border: round $primary; }
     """
 
     BINDINGS = [
@@ -124,7 +125,7 @@ class LinFWApp(App):
         Binding("f6,space", "toggle", "Выключить"),
         Binding("f7,j", "journal", "Журнал"),
         Binding("r", "refresh_now", "Обновить"),
-        Binding("q,ctrl+q", "quit", "Выход"),
+        Binding("f10,q,ctrl+q", "quit", "Выход"),
     ]
 
     def __init__(self, firewall: Firewall) -> None:
@@ -151,6 +152,7 @@ class LinFWApp(App):
             yield ToolButton("F5 ▼ Вниз", id="btn-down")
             yield ToolButton("F6 Выкл/Вкл", id="btn-toggle", variant="warning")
             yield ToolButton("F7 Журнал", id="btn-journal", variant="primary")
+            yield ToolButton("F10 Выход", id="btn-quit")
         yield ChainTabs(*[Tab(name, id=f"tab-{name}") for name in CHAINS], id="chains")
         # "renderable": the green/red/orange action text stays coloured under the cursor
         table = RulesTable(id="rules", cursor_type="row", zebra_stripes=True)
@@ -430,6 +432,10 @@ class LinFWApp(App):
             self._select = (rule.chain, rule.number + delta)
             self._shown = None
             self._render()
+
+    @on(Button.Pressed, "#btn-quit")
+    def _btn_quit(self) -> None:
+        self.exit()
 
     @on(Button.Pressed, "#btn-journal")
     def action_journal(self) -> None:
