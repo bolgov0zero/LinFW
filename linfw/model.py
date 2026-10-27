@@ -39,15 +39,6 @@ class Rule:
     def key(self) -> str:
         return f"{self.chain}:{self.index}"
 
-    @property
-    def is_catch_all_deny(self) -> bool:
-        return (
-            self.enabled
-            and self.action in ("drop", "reject")
-            and self.protocol == "all"
-            and not (self.source or self.destination or self.port or self.extra)
-        )
-
     def describe(self) -> str:
         return shlex.join(["-A", self.chain, *self.spec])
 
@@ -60,14 +51,6 @@ class NewRule:
     source: str = ""
     destination: str = ""
     port: str = ""
-
-    @property
-    def is_catch_all_deny(self) -> bool:
-        return (
-            self.action in ("DROP", "REJECT")
-            and self.protocol == "all"
-            and not (self.source or self.destination or self.port)
-        )
 
     def validated(self) -> "NewRule":
         """Return a normalized copy, or raise ValueError with a Russian message."""

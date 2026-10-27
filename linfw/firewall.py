@@ -57,15 +57,7 @@ class Firewall:
 
     def add(self, new: NewRule) -> None:
         new = new.validated()
-        rules = self.snapshot().rules[new.chain]
-        pos = len(rules) + 1
-        # a rule appended after a catch-all DROP/REJECT would never match
-        if not new.is_catch_all_deny:
-            for r in rules:
-                if r.is_catch_all_deny:
-                    pos = r.index
-                    break
-        self._insert(new.chain, pos, len(rules), new.to_spec())
+        self.runner.ipt(["-A", new.chain, *new.to_spec()])
 
     def delete(self, rule: Rule) -> None:
         self._current(rule)

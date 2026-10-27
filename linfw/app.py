@@ -68,10 +68,10 @@ class LinFWApp(App):
     TITLE = "LinFW"
     CSS = """
     Screen { background: $surface; }
-    #toolbar { height: 3; padding: 0 1; background: $panel; }
-    #toolbar Button { min-width: 0; margin-right: 1; }
+    #toolbar { height: 1; padding: 0 1; background: $panel; }
+    #toolbar Button { min-width: 0; height: 1; border: none; padding: 0 2; margin-right: 1; }
     #toolbar .spacer { width: 1fr; }
-    #brand { width: auto; content-align: center middle; height: 3; color: $accent; text-style: bold; }
+    #brand { width: auto; height: 1; color: $accent; text-style: bold; }
     #chains { height: 2; }
     #rules { height: 1fr; }
     DataTable { background: $surface; }

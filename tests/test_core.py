@@ -78,21 +78,13 @@ def actions(fw, chain):
     return [(r.action, r.enabled) for r in fw.snapshot().rules[chain]]
 
 
-def test_add_goes_before_catch_all_deny(fw):
-    before = len(fw.snapshot().rules["INPUT"])
+def test_add_always_appends_to_the_end(fw):
+    before = [r.spec for r in fw.snapshot().rules["INPUT"]]
+    assert fw.snapshot().rules["INPUT"][-1].action == "drop"  # trailing catch-all DROP
     fw.add(NewRule("INPUT", "tcp", "ACCEPT", port="8080"))
-    rules = fw.snapshot().rules["INPUT"]
-    assert len(rules) == before + 1
-    assert rules[-2].port == "8080" and rules[-1].is_catch_all_deny
-
-
-def test_add_appends_when_chain_has_no_catch_all_deny(fw):
-    # OUTPUT ends with "-j ACCEPT", which is not a deny rule: append at the end
-    fw.add(NewRule("OUTPUT", "tcp", "DROP", port="25"))
-    assert fw.snapshot().rules["OUTPUT"][-1].port == "25"
-
-
-def test_catch_all_deny_is_appended_last(fw):
+    after = fw.snapshot().rules["INPUT"]
+    assert [r.spec for r in after[:-1]] == before
+    assert after[-1].port == "8080"
     fw.add(NewRule("INPUT", "all", "REJECT"))
     assert fw.snapshot().rules["INPUT"][-1].action == "reject"
 
@@ -136,6 +128,17 @@ def test_toggle_roundtrip(fw):
     assert fw.toggle(off) is True
     on = fw.snapshot().rules["INPUT"][reject.index - 1]
     assert (on.enabled, on.action) == (True, "reject")
+
+
+def test_disabled_rules_keep_their_position(fw):
+    order = lambda: [(r.index, r.action) for r in fw.snapshot().rules["INPUT"]]  # noqa: E731
+    before = order()
+    for rule in fw.snapshot().rules["INPUT"]:
+        if rule.action in ("accept", "drop", "reject"):
+            fw.toggle(fw.snapshot().rules["INPUT"][rule.index - 1])
+    after = fw.snapshot().rules["INPUT"]
+    assert order() == before
+    assert [r.enabled for r in after if r.action in ("accept", "drop", "reject")] == [False] * 8
 
 
 def test_toggle_unsupported_target():
