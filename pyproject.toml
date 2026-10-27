@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linfw"
+version = "0.1.0"
+description = "TUI for managing iptables rules"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["textual>=1.0"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+linfw = "linfw.cli:main"
+
+[tool.setuptools]
+packages = ["linfw"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
