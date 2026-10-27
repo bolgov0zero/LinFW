@@ -59,6 +59,20 @@ class Firewall:
         new = new.validated()
         self.runner.ipt(["-A", new.chain, *new.to_spec()])
 
+    def edit(self, rule: Rule, new: NewRule) -> None:
+        """Replace a rule in place (same chain, same position, same on/off state).
+        Counters start from zero since it is, in effect, a different rule."""
+        self._current(rule)
+        self._refuse_base(rule)
+        new = new.validated()
+        if new.chain != rule.chain:
+            raise FirewallError("Цепочку существующего правила изменить нельзя")
+        spec = new.to_spec()
+        if not rule.enabled:
+            self._ensure_off_chains()
+            spec[-1] = OFF_PREFIX + new.action
+        self.runner.ipt(["-R", rule.chain, str(rule.index), *spec])
+
     def delete(self, rule: Rule) -> None:
         self._current(rule)
         self._refuse_base(rule)

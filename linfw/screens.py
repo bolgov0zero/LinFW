@@ -19,10 +19,10 @@ TEMPLATES = [
 ]
 
 
-def _choice(label: str, name: str, values: List[str], selected: str) -> ComposeResult:
+def _choice(label: str, name: str, values: List[str], selected: str, disabled: bool = False) -> ComposeResult:
     with Horizontal(classes="row"):
         yield Label(label, classes="label")
-        with RadioSet(id=name):
+        with RadioSet(id=name, disabled=disabled):
             for v in values:
                 yield RadioButton(v.lower() if name == "action" else v, value=(v == selected), name=v)
 
@@ -35,25 +35,33 @@ def _picked(dialog: ModalScreen, name: str) -> str:
 class AddRuleScreen(ModalScreen[Optional[NewRule]]):
     BINDINGS = [Binding("escape", "cancel", "Отмена")]
 
-    def __init__(self, chain: str = "INPUT") -> None:
+    def __init__(self, chain: str = "INPUT", rule: Optional[Rule] = None) -> None:
         super().__init__()
-        self._chain = chain if chain in CHAINS else "INPUT"
+        self._rule = rule  # set when editing an existing rule
+        self._initial = rule.to_new() if rule else NewRule(chain if chain in CHAINS else "INPUT")
 
     def compose(self) -> ComposeResult:
+        init = self._initial
         with Vertical(classes="dialog"):
-            yield Label("Добавить правило", classes="title")
-            yield from _choice("Chain", "chain", list(CHAINS), self._chain)
-            yield from _choice("Protocol", "protocol", list(PROTOCOLS), "all")
-            yield from _choice("Action", "action", list(ACTIONS), "ACCEPT")
+            yield Label("Редактировать правило" if self._rule else "Добавить правило", classes="title")
+            # a rule cannot change chain in place
+            yield from _choice("Chain", "chain", list(CHAINS), init.chain, disabled=self._rule is not None)
+            yield from _choice("Protocol", "protocol", list(PROTOCOLS), init.protocol)
+            yield from _choice("Action", "action", list(ACTIONS), init.action)
             with Horizontal(classes="row"):
                 yield Label("Source", classes="label")
-                yield Input(placeholder="any или 192.168.1.0/24", id="source")
+                yield Input(init.source, placeholder="any или 192.168.1.0/24", id="source")
             with Horizontal(classes="row"):
                 yield Label("Destination", classes="label")
-                yield Input(placeholder="any или 10.0.0.5", id="destination")
+                yield Input(init.destination, placeholder="any или 10.0.0.5", id="destination")
             with Horizontal(classes="row"):
                 yield Label("Port", classes="label")
-                yield Input(placeholder="22  ·  80,443  ·  1000:2000", id="port", disabled=True)
+                yield Input(
+                    init.port,
+                    placeholder="22  ·  80,443  ·  1000:2000",
+                    id="port",
+                    disabled=init.protocol not in ("tcp", "udp"),
+                )
             yield Label("", id="error")
             with Horizontal(classes="buttons"):
                 yield Button("Сохранить", variant="success", id="save")

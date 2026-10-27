@@ -138,3 +138,46 @@ async def test_switching_to_an_empty_chain_clears_the_table():
         await pilot.press("left")  # INPUT
         await pilot.pause()
         assert table.row_count == 1
+
+
+async def test_double_click_and_enter_open_the_editor():
+    app, runner = make_app()
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        await pilot.press("right")  # INPUT: visible #1 ssh, #2 web
+        await pilot.pause()
+        table = app.query_one(DataTable)
+        # header is line 0, so rows start at y=1: double click the second row
+        await pilot.click(DataTable, offset=(10, 2), times=2)
+        await pilot.pause()
+        assert isinstance(app.screen, AddRuleScreen)
+        assert table.cursor_row == 1
+        assert app.screen.query_one("#port", Input).value == "80,443"
+        assert app.screen.query_one("#chain", RadioSet).disabled
+        app.screen.query_one("#port", Input).value = "8443"
+        await pilot.click("#save")
+        await pilot.pause(0.4)
+        assert not isinstance(app.screen, AddRuleScreen)
+        assert runner.rules["INPUT"][3][2] == ["-p", "tcp", "--dport", "8443", "-j", "ACCEPT"]
+        assert table.cursor_row == 1
+
+        await pilot.press("up", "enter")  # Enter edits the highlighted rule too
+        await pilot.pause()
+        assert isinstance(app.screen, AddRuleScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+
+        await pilot.click(DataTable, offset=(10, 0), times=2)  # header: nothing opens
+        await pilot.pause()
+        assert not isinstance(app.screen, AddRuleScreen)
+
+
+async def test_complex_rule_is_not_editable_in_dialog():
+    runner = DemoRunner(sample=False, jitter=False)
+    runner.rules["INPUT"].append([0, 0, ["-i", "eth0", "-j", "DROP"]])
+    app = LinFWApp(Firewall(runner))
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not isinstance(app.screen, AddRuleScreen)

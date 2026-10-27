@@ -200,3 +200,39 @@ def test_remove_base(fw):
     snap = fw.snapshot()
     assert not any(r.hidden for rules in snap.rules.values() for r in rules)
     assert not fw.remove_base()
+
+
+def test_edit_in_place_keeps_position_and_state(fw):
+    ssh = fw.snapshot().rules["INPUT"][2]
+    assert ssh.editable
+    fw.edit(ssh, NewRule("INPUT", "tcp", "DROP", source="10.0.0.0/8", port="2222"))
+    after = fw.snapshot().rules["INPUT"]
+    assert [r.index for r in after] == [r.index for r in fw.snapshot().rules["INPUT"]]
+    edited = after[2]
+    assert (edited.action, edited.port, edited.source, edited.enabled) == ("drop", "2222", "10.0.0.0/8", True)
+    # a disabled rule stays disabled
+    fw.toggle(edited)
+    off = fw.snapshot().rules["INPUT"][2]
+    fw.edit(off, NewRule("INPUT", "udp", "REJECT", port="53"))
+    again = fw.snapshot().rules["INPUT"][2]
+    assert (again.enabled, again.action, again.protocol, again.port) == (False, "reject", "udp", "53")
+
+
+def test_edit_refuses_chain_change_base_and_stale(fw):
+    rules = fw.snapshot().rules["INPUT"]
+    with pytest.raises(FirewallError):
+        fw.edit(rules[2], NewRule("OUTPUT", "tcp", "ACCEPT"))
+    with pytest.raises(FirewallError):
+        fw.edit(rules[0], NewRule("INPUT"))
+    fw.delete(rules[2])
+    with pytest.raises(FirewallError):
+        fw.edit(rules[3], NewRule("INPUT"))  # shifted: stale view
+
+
+def test_editable_flags():
+    snap = parse_save(SAVE)
+    lo, ssh, web, udp = snap.rules["INPUT"]
+    assert not lo.editable  # -i lo
+    assert ssh.editable
+    assert not web.editable  # comment
+    assert not udp.editable  # negated source, source port

@@ -4,7 +4,7 @@ import asyncio
 from typing import Callable, Dict, List, Optional, Tuple
 
 from rich.text import Text
-from textual import on
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
@@ -61,7 +61,13 @@ class RulesTable(DataTable):
     BINDINGS = [
         Binding("left", "app.prev_chain", show=False),
         Binding("right", "app.next_chain", show=False),
+        Binding("enter", "app.edit", show=False),
     ]
+
+    def on_click(self, event: events.Click) -> None:
+        # double click on a data row (not the header) edits it
+        if event.chain == 2 and event.style.meta.get("row", -1) >= 0:
+            self.app.action_edit()
 
 
 class LinFWApp(App):
@@ -102,6 +108,7 @@ class LinFWApp(App):
 
     BINDINGS = [
         Binding("f1,a", "add", "Добавить"),
+        Binding("e", "edit", "Изменить"),
         Binding("f2,delete,x", "delete", "Удалить"),
         Binding("f3,t", "template", "Шаблон"),
         Binding("f4,u", "move(-1)", "Вверх"),
@@ -338,6 +345,31 @@ class LinFWApp(App):
                 self._shown = None
                 self._render()
                 return
+
+    def action_edit(self) -> None:
+        rule = self._selected_rule()
+        if not rule:
+            return
+        if not rule.editable:
+            self.notify(
+                "У правила есть условия, которых нет в окне редактирования (см. «+» в колонке port). "
+                "Удалите его и создайте заново.",
+                severity="warning",
+                timeout=8,
+            )
+            return
+
+        def done(new: Optional[NewRule]) -> None:
+            if new:
+                self.run_worker(self._edit(rule, new))
+
+        self.push_screen(AddRuleScreen(rule.chain, rule), done)
+
+    async def _edit(self, rule: Rule, new: NewRule) -> None:
+        if await self._apply("Правило изменено", lambda: self.fw.edit(rule, new)):
+            self._select = (rule.chain, rule.index)
+            self._shown = None
+            self._render()
 
     @on(Button.Pressed, "#btn-delete")
     def action_delete(self) -> None:

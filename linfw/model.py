@@ -74,6 +74,21 @@ class Rule:
     def hidden(self) -> bool:
         return self.base_id is not None
 
+    @property
+    def editable(self) -> bool:
+        """True if the add/edit dialog can represent this rule without losing conditions."""
+        return (
+            not self.hidden
+            and not self.extra
+            and self.protocol in PROTOCOLS
+            and self.action.upper() in ACTIONS
+            and not any(s.startswith("!") for s in (self.source, self.destination, self.port))
+            and not self.port.startswith(("sp:", "dp:"))
+        )
+
+    def to_new(self) -> "NewRule":
+        return NewRule(self.chain, self.protocol, self.action.upper(), self.source, self.destination, self.port)
+
     def describe(self) -> str:
         return shlex.join(["-A", self.chain, *self.spec])
 
