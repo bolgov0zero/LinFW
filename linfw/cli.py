@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 
 from . import __version__
@@ -24,8 +25,10 @@ def main() -> None:
         if not sys.platform.startswith("linux"):
             sys.exit("LinFW работает только в Linux. Для знакомства с интерфейсом: linfw --demo")
         if os.geteuid() != 0:
-            # managing iptables needs root: re-run ourselves through sudo
-            os.execvp("sudo", ["sudo", sys.executable, "-m", "linfw", *sys.argv[1:]])
+            # managing iptables needs root: re-run ourselves through sudo if there is one
+            if shutil.which("sudo"):
+                os.execvp("sudo", ["sudo", sys.executable, "-m", "linfw", *sys.argv[1:]])
+            sys.exit("Нужны права root, а sudo не установлен. Станьте root (su -) и запустите linfw снова.")
         try:
             runner = SystemRunner()
         except FirewallError as exc:

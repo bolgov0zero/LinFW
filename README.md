@@ -8,6 +8,12 @@ TUI для управления правилами iptables. Команда `lin
 curl -fsSL https://raw.githubusercontent.com/bolgov0zero/LinFW/main/install.sh | sudo bash
 ```
 
+Если sudo не установлен, станьте root (`su -`) и запустите ту же команду без `sudo`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bolgov0zero/LinFW/main/install.sh | bash
+```
+
 Установщик:
 
 - ставит `python3`, `iptables` и пакет, который восстанавливает правила при загрузке
@@ -19,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/bolgov0zero/LinFW/main/install.sh |
 ## Запуск
 
 ```bash
-linfw          # сам перезапустится через sudo, если вы не root
+linfw          # не root: перезапустится через sudo; если sudo нет — запускайте от root
 linfw --demo   # тестовые правила в памяти, без root и iptables (можно и на macOS)
 ```
 

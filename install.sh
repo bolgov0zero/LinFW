@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # LinFW installer.
 #   curl -fsSL https://raw.githubusercontent.com/bolgov0zero/LinFW/main/install.sh | sudo bash
-#   sudo ./install.sh              # from a cloned repository
-#   sudo ./install.sh --uninstall
+#   curl -fsSL https://raw.githubusercontent.com/bolgov0zero/LinFW/main/install.sh | bash   # as root, no sudo needed
+#   ./install.sh              # from a cloned repository (uses sudo if present and you are not root)
+#   ./install.sh --uninstall
 #
 # Installs LinFW into a private virtualenv (/opt/linfw), links /usr/local/bin/linfw
 # and sets up the distro's mechanism for restoring iptables rules after a reboot.
@@ -20,7 +21,16 @@ die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 [ "$(uname -s)" = "Linux" ] || die "LinFW работает только в Linux."
 
 if [ "$(id -u)" -ne 0 ]; then
-  die "Нужны права root. Запустите: curl -fsSL https://raw.githubusercontent.com/${REPO}/${REF}/install.sh | sudo bash"
+  # sudo is optional: as root (e.g. after `su -`) just run the script without it
+  SELF="${BASH_SOURCE[0]:-}"
+  if command -v sudo >/dev/null && [ -n "$SELF" ] && [ -f "$SELF" ]; then
+    exec sudo bash "$SELF" "$@"
+  fi
+  URL="https://raw.githubusercontent.com/${REPO}/${REF}/install.sh"
+  if command -v sudo >/dev/null; then
+    die "Нужны права root. Запустите: curl -fsSL $URL | sudo bash"
+  fi
+  die "Нужны права root, а sudo не установлен. Станьте root (su -) и запустите: curl -fsSL $URL | bash"
 fi
 
 if [ "${1:-}" = "--uninstall" ]; then
