@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import random
 import shlex
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
+from .journal import LogEntry
 from .model import CHAINS, FirewallError
 
 _SAMPLE = [
@@ -25,6 +27,18 @@ _SAMPLE = [
 ]
 
 
+_DEMO_HITS = [
+    ("INPUT", "drop", "tcp", "203.0.113.%d", "192.168.1.10", "22"),
+    ("INPUT", "drop", "tcp", "198.51.100.%d", "192.168.1.10", "3389"),
+    ("INPUT", "accept", "tcp", "10.0.0.%d", "192.168.1.10", "443"),
+    ("INPUT", "reject", "udp", "10.0.0.%d", "192.168.1.10", "161"),
+    ("INPUT", "drop", "icmp", "203.0.113.%d", "192.168.1.10", "-"),
+    ("OUTPUT", "drop", "tcp", "192.168.1.10", "198.51.100.%d", "25"),
+    ("OUTPUT", "accept", "udp", "192.168.1.10", "8.8.8.%d", "53"),
+    ("FORWARD", "reject", "tcp", "192.168.1.%d", "10.10.0.5", "8080"),
+]
+
+
 class DemoRunner:
     def __init__(self, sample: bool = True, jitter: bool = True) -> None:
         self.policies = {"INPUT": "ACCEPT", "FORWARD": "DROP", "OUTPUT": "ACCEPT"}
@@ -32,6 +46,11 @@ class DemoRunner:
         self.rules: Dict[str, List[List]] = {c: [] for c in CHAINS}  # [pkts, bytes, tokens]
         self.persist_calls = 0
         self._jitter = jitter
+        self._hits: List[LogEntry] = []
+        if sample:
+            for _ in range(24):
+                self._add_hit(datetime.now() - timedelta(seconds=random.randint(5, 3600)))
+            self._hits.sort(key=lambda e: e.time)
         if sample:
             for chain, line, pkts in _SAMPLE:
                 self.rules[chain].append([pkts, pkts * 90, shlex.split(line)])
@@ -94,6 +113,19 @@ class DemoRunner:
                 lines.append(f"[{pkts}:{nbytes}] -A {name} {shlex.join(tokens)}")
         lines.append("COMMIT")
         return "\n".join(lines) + "\n"
+
+    def _add_hit(self, when: datetime) -> None:
+        chain, action, proto, src, dst, port = random.choice(_DEMO_HITS)
+        fill = lambda s: s % random.randint(2, 250) if "%d" in s else s  # noqa: E731
+        self._hits.append(
+            LogEntry(when.strftime("%Y-%m-%d %H:%M:%S"), chain, action, proto, fill(src), fill(dst), port)
+        )
+
+    def read_journal(self) -> Tuple[str, List[LogEntry]]:
+        if self._jitter and self._hits:
+            for _ in range(random.choice((0, 0, 1, 2))):
+                self._add_hit(datetime.now())
+        return "demo", list(self._hits)
 
     def persist(self) -> str:
         self.persist_calls += 1

@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 from typing import List, Optional
 
+from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, OptionList, RadioButton, RadioSet
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Button, Checkbox, DataTable, Input, Label, OptionList, RadioButton, RadioSet, Static
 from textual.widgets.option_list import Option
 
-from .model import ACTIONS, CHAINS, PROTOCOLS, NewRule, Rule
+from .journal import LogEntry
+from .model import ACTIONS, CHAINS, PROTOCOLS, FirewallError, NewRule, Rule
+
+ACTION_STYLE = {"accept": "bold #2ecc71", "drop": "bold #ff5555", "reject": "bold #ff9f1a"}
+
+
+class ToolButton(Button, can_focus=False):
+    """Toolbar buttons never steal focus, so the arrow keys keep driving the table."""
 
 TEMPLATES = [
     ("Открыть для всех SSH (порт 22)", NewRule("INPUT", "tcp", "ACCEPT", port="22")),
@@ -62,6 +71,9 @@ class AddRuleScreen(ModalScreen[Optional[NewRule]]):
                     id="port",
                     disabled=init.protocol not in ("tcp", "udp"),
                 )
+            with Horizontal(classes="row"):
+                yield Label("Journal", classes="label")
+                yield Checkbox("писать срабатывания в журнал", init.log, id="log")
             yield Label("", id="error")
             with Horizontal(classes="buttons"):
                 yield Button("Сохранить", variant="success", id="save")
@@ -90,6 +102,7 @@ class AddRuleScreen(ModalScreen[Optional[NewRule]]):
             self.query_one("#source", Input).value,
             self.query_one("#destination", Input).value,
             self.query_one("#port", Input).value,
+            self.query_one("#log", Checkbox).value,
         )
         try:
             rule = raw.validated()
@@ -163,3 +176,116 @@ def rule_summary(rule: Rule) -> str:
         parts.append(f"port {rule.port}")
     parts.append(rule.action)
     return "  ".join(parts)
+
+
+FILTERS = (None,) + CHAINS  # None = all chains
+COLUMNS = ("time", "chain", "protocol", "source", "destination", "port", "action")
+POLL_SECONDS = 3.0
+
+
+class JournalTable(DataTable):
+    BINDINGS = [
+        Binding("left", "screen.prev_filter", show=False),
+        Binding("right", "screen.next_filter", show=False),
+    ]
+
+
+class JournalScreen(Screen):
+    """Rule hits read back from the kernel log, newest first."""
+
+    BINDINGS = [Binding("escape,q,f7", "back", "К правилам")]
+
+    def __init__(self, firewall) -> None:
+        super().__init__()
+        self.fw = firewall
+        self.filter: Optional[str] = None
+        self._entries: List[LogEntry] = []
+        self._source = ""
+        self._error = ""
+        self._shown: Optional[List[LogEntry]] = None
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="jbar"):
+            for chain in FILTERS:
+                yield ToolButton(chain or "Все", id=f"jf-{chain or 'ALL'}", classes="jfilter")
+            yield Static("", classes="spacer")
+            yield ToolButton("Esc ← К правилам", id="jback", variant="primary")
+        table = JournalTable(id="jtable", cursor_type="row", zebra_stripes=True)
+        table.cursor_foreground_priority = "renderable"
+        yield table
+        yield Static("", id="jstatus")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#jtable", JournalTable)
+        for name in COLUMNS:
+            table.add_column(name, key=name)
+        table.focus()
+        self._mark_filter()
+        self.set_interval(POLL_SECONDS, self._poll)
+        self.run_worker(self._poll())
+
+    async def _poll(self) -> None:
+        try:
+            self._source, self._entries = await asyncio.to_thread(self.fw.read_journal)
+            self._error = ""
+        except FirewallError as exc:
+            self._error = str(exc)
+        self._redraw()
+
+    def _mark_filter(self) -> None:
+        for chain in FILTERS:
+            self.query_one(f"#jf-{chain or 'ALL'}", ToolButton).set_class(chain == self.filter, "active")
+
+    def _redraw(self) -> None:
+        table = self.query_one("#jtable", JournalTable)
+        shown = [e for e in reversed(self._entries) if self.filter in (None, e.chain)]
+        if shown != self._shown:
+            row, scroll = table.cursor_row, table.scroll_y
+            table.clear()
+            for e in shown:
+                table.add_row(
+                    e.time,
+                    e.chain.lower(),
+                    e.protocol,
+                    e.source,
+                    e.destination,
+                    e.port,
+                    Text(e.action, style=ACTION_STYLE.get(e.action, "bold")),
+                )
+            if shown:
+                table.move_cursor(row=min(row, len(shown) - 1), animate=False)
+            table.scroll_y = scroll
+            self._shown = shown
+        status = self.query_one("#jstatus", Static)
+        if self._error:
+            status.update(Text(self._error, style="bold #ff5555"))
+        elif not self._entries:
+            status.update(
+                "Записей нет. Включите «Journal» в окне правила (F1 / e): запись появится, когда правило сработает."
+            )
+        else:
+            status.update(
+                f"Источник: {self._source}  ·  показано {len(shown)} из {len(self._entries)}"
+                "  ·  ←→ цепочка  ·  Esc назад"
+            )
+
+    def _set_filter(self, chain: Optional[str]) -> None:
+        self.filter = chain
+        self._shown = None
+        self._mark_filter()
+        self._redraw()
+
+    @on(Button.Pressed, ".jfilter")
+    def _filter_pressed(self, event: Button.Pressed) -> None:
+        name = (event.button.id or "jf-ALL")[3:]
+        self._set_filter(None if name == "ALL" else name)
+
+    def action_next_filter(self) -> None:
+        self._set_filter(FILTERS[(FILTERS.index(self.filter) + 1) % len(FILTERS)])
+
+    def action_prev_filter(self) -> None:
+        self._set_filter(FILTERS[(FILTERS.index(self.filter) - 1) % len(FILTERS)])
+
+    @on(Button.Pressed, "#jback")
+    def action_back(self) -> None:
+        self.app.pop_screen()

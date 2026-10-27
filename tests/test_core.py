@@ -236,3 +236,137 @@ def test_editable_flags():
     assert ssh.editable
     assert not web.editable  # comment
     assert not udp.editable  # negated source, source port
+
+
+# -- logging (hidden LOG twin above the rule) -------------------------------
+
+
+def visible(fw, chain="INPUT"):
+    return [r for r in fw.snapshot().rules[chain] if not r.hidden]
+
+
+def logged_specs(fw, chain="INPUT"):
+    """Real chain layout as (kind, port) pairs: 'log' twin or 'rule'."""
+    return [("log" if r.is_log else "rule", r.port) for r in fw.snapshot().rules[chain] if not r.base_id]
+
+
+def test_add_with_log_creates_hidden_twin(fw):
+    before = len(visible(fw))
+    fw.add(NewRule("INPUT", "tcp", "DROP", port="2222", log=True))
+    rules = fw.snapshot().rules["INPUT"]
+    main, twin = rules[-1], rules[-2]
+    assert twin.is_log and twin.hidden and not main.hidden
+    assert main.log and main.port == "2222" and main.number == before + 1
+    assert twin.spec[-6:-4] == ("-j", "LOG") and "LINFW:INPUT:DROP: " in twin.spec
+    assert "limit" in twin.spec  # rate-limited
+    assert len(visible(fw)) == before + 1  # the twin is not listed
+    assert not visible(fw)[0].log  # default: off
+
+
+def test_edit_turns_logging_on_and_off_in_place(fw):
+    ssh = visible(fw)[0]
+    total = len(fw.snapshot().rules["INPUT"])
+    fw.edit(ssh, NewRule("INPUT", "tcp", "ACCEPT", port="22", log=True))
+    rules = fw.snapshot().rules["INPUT"]
+    assert len(rules) == total + 1 and rules[2].is_log and rules[3].port == "22" and rules[3].log
+    fw.edit(rules[3], NewRule("INPUT", "tcp", "DROP", port="2200", log=True))  # twin follows the edit
+    rules = fw.snapshot().rules["INPUT"]
+    assert rules[2].is_log and "LINFW:INPUT:DROP: " in rules[2].spec and "2200" in rules[2].spec
+    assert rules[3].action == "drop"
+    fw.edit(rules[3], NewRule("INPUT", "tcp", "DROP", port="2200", log=False))
+    rules = fw.snapshot().rules["INPUT"]
+    assert len(rules) == total and not any(r.is_log for r in rules) and not rules[2].log
+
+
+def test_delete_removes_the_twin(fw):
+    fw.add(NewRule("INPUT", "udp", "DROP", port="5353", log=True))
+    total = len(fw.snapshot().rules["INPUT"])
+    fw.delete(visible(fw)[-1])
+    rules = fw.snapshot().rules["INPUT"]
+    assert len(rules) == total - 2 and not any(r.is_log for r in rules)
+
+
+def test_move_keeps_blocks_together(fw):
+    # layout: ... ssh | web | icmp | drop203 | reject | dropall | [log tcp 7001] 7001 | [log tcp 7002] 7002
+    fw.add(NewRule("INPUT", "tcp", "ACCEPT", port="7001", log=True))
+    fw.add(NewRule("INPUT", "tcp", "ACCEPT", port="7002", log=True))
+    tail = lambda: logged_specs(fw)[-4:]  # noqa: E731
+    assert tail() == [("log", "7001"), ("rule", "7001"), ("log", "7002"), ("rule", "7002")]
+
+    assert fw.move(visible(fw)[-1], -1)  # 7002 goes above 7001, twin included
+    assert tail() == [("log", "7002"), ("rule", "7002"), ("log", "7001"), ("rule", "7001")]
+    assert fw.move(visible(fw)[-2], 1)  # and back down
+    assert tail() == [("log", "7001"), ("rule", "7001"), ("log", "7002"), ("rule", "7002")]
+
+    # an unlogged neighbour hops over a whole block as well
+    last_plain = visible(fw)[-3]  # the catch-all DROP, the rule just above the 7001 block
+    assert not last_plain.log and fw.move(last_plain, 1)
+    assert [k for k, _ in logged_specs(fw)][-5:] == ["log", "rule", "rule", "log", "rule"]
+    assert fw.move(visible(fw)[-2], -1)
+    assert not fw.move(visible(fw)[-1], 1)  # already last
+    assert not fw.move(visible(fw)[0], -1)  # already first visible
+    assert all(r.is_log == (i > 0 and fw.snapshot().rules["INPUT"][i + 1].log) for i, r in enumerate(fw.snapshot().rules["INPUT"][:-1]) if r.is_log)
+
+
+def test_move_carries_counters_of_both_rules():
+    runner = DemoRunner(sample=False, jitter=False)
+    fw = Firewall(runner)
+    fw.ensure_base()
+    fw.add(NewRule("INPUT", "tcp", "ACCEPT", port="1", log=True))
+    fw.add(NewRule("INPUT", "tcp", "ACCEPT", port="2", log=True))
+    entries = [e for e in runner.rules["INPUT"] if "linfw:base:lo" not in e[2] and "linfw:base:est" not in e[2]]
+    # entries: log1, rule1, log2, rule2 -> give the second pair distinctive counters
+    entries[2][0], entries[3][0] = 7, 55
+    assert fw.move(visible(fw)[-1], -1)
+    tail = [e[0] for e in runner.rules["INPUT"][-4:]]
+    assert tail == [7, 55, 0, 0]  # second pair now first, counters intact, pair order kept
+
+
+def test_toggle_disables_the_twin_too(fw):
+    fw.add(NewRule("INPUT", "tcp", "DROP", port="2222", log=True))
+    rule = visible(fw)[-1]
+    assert fw.toggle(rule) is False
+    rules = fw.snapshot().rules["INPUT"]
+    twin, off = rules[-2], rules[-1]
+    assert not off.enabled and not twin.enabled
+    assert twin.spec[-2:] == ("-j", "LINFW_OFF_LOG") and "--log-prefix" not in twin.spec
+    assert off.log  # still flagged
+    assert fw.toggle(off) is True
+    rules = fw.snapshot().rules["INPUT"]
+    assert rules[-1].enabled and rules[-2].spec[-6:] == ("-j", "LOG", "--log-prefix", "LINFW:INPUT:DROP: ", "--log-level", "4")
+
+
+def test_twins_cannot_be_touched_directly(fw):
+    fw.add(NewRule("INPUT", "tcp", "DROP", port="2222", log=True))
+    twin = fw.snapshot().rules["INPUT"][-2]
+    for op in (fw.delete, fw.toggle, lambda r: fw.move(r, 1)):
+        with pytest.raises(FirewallError):
+            op(twin)
+
+
+def test_base_rules_check_ignores_log_twins(fw):
+    fw.add(NewRule("INPUT", "tcp", "DROP", port="2222", log=True))
+    assert fw.base_ok(fw.snapshot()) and not fw.ensure_base()
+
+
+# -- journal parsing -----------------------------------------------------------
+
+from linfw.journal import parse_line, parse_text  # noqa: E402
+
+
+def test_parse_journal_line_variants():
+    e = parse_line("2026-10-27T12:00:01+0300 srv kernel: LINFW:INPUT:DROP: IN=eth0 OUT= SRC=1.2.3.4 DST=5.6.7.8 LEN=60 PROTO=TCP SPT=5555 DPT=22")
+    assert (e.time, e.chain, e.action, e.protocol, e.source, e.destination, e.port) == (
+        "2026-10-27 12:00:01", "INPUT", "drop", "tcp", "1.2.3.4", "5.6.7.8", "22")
+    icmp = parse_line("Oct 27 12:00:01 srv kernel: [ 9.1] LINFW:OUTPUT:ACCEPT: IN= OUT=eth0 SRC=10.0.0.1 DST=8.8.8.8 PROTO=ICMP TYPE=8")
+    assert (icmp.protocol, icmp.port, icmp.time, icmp.chain) == ("icmp", "-", "Oct 27 12:00:01", "OUTPUT")
+    assert parse_line("[Tue Oct 27 12:00:01 2026] LINFW:FORWARD:REJECT: SRC=1.1.1.1 DST=2.2.2.2 PROTO=UDP SPT=1 DPT=53").time == "Oct 27 12:00:01 2026"
+    assert parse_line("kernel: something else entirely") is None
+    assert parse_line("kernel: LINFW:INPUT:DROP: garbage") is None
+
+
+def test_parse_text_keeps_order_and_limit():
+    lines = [f"2026-10-27T12:00:{i % 60:02d}+0000 h kernel: LINFW:INPUT:DROP: SRC=1.1.1.{i % 250} DST=2.2.2.2 PROTO=TCP DPT=22" for i in range(1500)]
+    lines.insert(3, "unrelated line")
+    entries = parse_text("\n".join(lines))
+    assert len(entries) == 1000 and entries[-1].source == "1.1.1.%d" % (1499 % 250)

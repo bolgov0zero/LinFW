@@ -13,7 +13,15 @@ ACTIONS = ("ACCEPT", "DROP", "REJECT")
 # but jumps to an empty user chain, which is a no-op: the packet returns and is
 # evaluated against the next rule. One chain per action remembers the original.
 OFF_PREFIX = "LINFW_OFF_"
-OFF_CHAINS = tuple(OFF_PREFIX + a for a in ACTIONS)
+OFF_CHAINS = tuple(OFF_PREFIX + a for a in ACTIONS) + (OFF_PREFIX + "LOG",)
+
+# Logging: a rule with "write to the journal" is preceded by a hidden twin rule
+# with the same matches whose target is LOG (non-terminating: the packet goes on
+# to the real rule). The twin is rate-limited so a busy rule cannot flood the log.
+LOG_TAG = "linfw:log"
+LOG_PREFIX = "LINFW"  # kernel log lines look like "LINFW:INPUT:DROP: IN=eth0 ... SRC=..."
+LOG_RATE = "10/min"
+LOG_BURST = "10"
 
 
 # Base rules: always on top of the chain, never shown in the table and never
@@ -26,6 +34,10 @@ BASE_RULES = {
     "OUTPUT": [("lo", ["-o", "lo"]), ("est", _ESTABLISHED)],
     "FORWARD": [("est", _ESTABLISHED)],
 }
+
+
+def log_prefix(chain: str, action: str) -> str:
+    return f"{LOG_PREFIX}:{chain}:{action}: "
 
 
 def base_ids(chain: str) -> List[str]:
@@ -57,7 +69,8 @@ class Rule:
     enabled: bool
     spec: Tuple[str, ...]  # tokens after "-A CHAIN", used to re-issue the rule
     extra: Tuple[str, ...] = ()  # matches that have no column of their own
-    number: int = 0  # position shown to the user: base rules are not counted
+    number: int = 0  # position shown to the user: hidden rules are not counted
+    log: bool = False  # a hidden log twin sits right above this rule
 
     @property
     def key(self) -> str:
@@ -71,8 +84,15 @@ class Rule:
         return None
 
     @property
+    def is_log(self) -> bool:
+        """True for the hidden LOG twin of the rule below it."""
+        return any(
+            tok == "--comment" and self.spec[i + 1] == LOG_TAG for i, tok in enumerate(self.spec[:-1])
+        )
+
+    @property
     def hidden(self) -> bool:
-        return self.base_id is not None
+        return self.base_id is not None or self.is_log
 
     @property
     def editable(self) -> bool:
@@ -87,7 +107,9 @@ class Rule:
         )
 
     def to_new(self) -> "NewRule":
-        return NewRule(self.chain, self.protocol, self.action.upper(), self.source, self.destination, self.port)
+        return NewRule(
+            self.chain, self.protocol, self.action.upper(), self.source, self.destination, self.port, self.log
+        )
 
     def describe(self) -> str:
         return shlex.join(["-A", self.chain, *self.spec])
@@ -101,6 +123,7 @@ class NewRule:
     source: str = ""
     destination: str = ""
     port: str = ""
+    log: bool = False
 
     def validated(self) -> "NewRule":
         """Return a normalized copy, or raise ValueError with a Russian message."""
@@ -120,6 +143,7 @@ class NewRule:
             _normalize_address(self.source, "Source"),
             _normalize_address(self.destination, "Destination"),
             port,
+            bool(self.log),
         )
 
     def to_spec(self) -> List[str]:
@@ -136,6 +160,15 @@ class NewRule:
             else:
                 spec += ["--dport", self.port]
         return spec + ["-j", self.action]
+
+    def to_log_spec(self, enabled: bool = True) -> List[str]:
+        """The hidden twin: same matches, then LOG (or, while the rule is switched
+        off, a jump to the empty LINFW_OFF_LOG chain)."""
+        spec = self.to_spec()[:-2] + ["-m", "comment", "--comment", LOG_TAG]
+        spec += ["-m", "limit", "--limit", LOG_RATE, "--limit-burst", LOG_BURST]
+        if enabled:
+            return spec + ["-j", "LOG", "--log-prefix", log_prefix(self.chain, self.action), "--log-level", "4"]
+        return spec + ["-j", OFF_PREFIX + "LOG"]
 
 
 def _normalize_address(value: str, label: str) -> str:

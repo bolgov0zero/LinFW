@@ -184,3 +184,95 @@ async def test_complex_rule_is_not_editable_in_dialog():
         await pilot.press("enter")
         await pilot.pause()
         assert not isinstance(app.screen, AddRuleScreen)
+
+
+from linfw.screens import JournalScreen  # noqa: E402
+from textual.widgets import Checkbox  # noqa: E402
+
+
+async def test_log_checkbox_creates_a_logged_rule_and_marks_the_row():
+    app, runner = make_app()
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        await pilot.press("f1")
+        await pilot.pause()
+        assert app.screen.query_one("#log", Checkbox).value is False  # off by default
+        app.screen.query_one("#protocol", RadioSet).query("RadioButton")[1].toggle()  # tcp
+        await pilot.pause()
+        app.screen.query_one("#port", Input).value = "9999"
+        app.screen.query_one("#log", Checkbox).value = True
+        await pilot.click("#save")
+        await pilot.pause(0.5)
+        assert any("LOG" in t for _, _, t in runner.rules["INPUT"])
+        table = app.query_one(DataTable)
+        last = [str(c) for c in table.get_row_at(table.row_count - 1)]
+        assert last[-1] == "accept ●" and last[6] == "9999"
+        assert table.row_count == 7  # the twin is not a row
+
+        await pilot.press("e")  # editing shows the stored flag
+        await pilot.pause()
+        assert app.screen.query_one("#log", Checkbox).value is True
+        await pilot.press("escape")
+
+
+async def test_journal_screen_filters_and_returns():
+    app, runner = make_app()
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        await pilot.click("#btn-journal")
+        await pilot.pause(0.5)
+        assert isinstance(app.screen, JournalScreen)
+        table = app.screen.query_one("#jtable", DataTable)
+        total = len(runner.read_journal()[1])
+        assert table.row_count == total > 0
+        assert [str(c.label) for c in table.columns.values()] == [
+            "time", "chain", "protocol", "source", "destination", "port", "action"]
+
+        await pilot.press("f1")  # main-screen shortcuts are inert here
+        await pilot.pause()
+        assert isinstance(app.screen, JournalScreen)
+
+        await pilot.click("#jf-OUTPUT")
+        await pilot.pause(0.4)
+        wanted = sum(e.chain == "OUTPUT" for e in runner.read_journal()[1])
+        assert table.row_count == wanted
+        assert {str(table.get_row_at(i)[1]) for i in range(table.row_count)} == {"output"}
+        await pilot.press("right")  # -> FORWARD
+        await pilot.pause()
+        assert {str(table.get_row_at(i)[1]) for i in range(table.row_count)} <= {"forward"}
+        await pilot.press("left", "left", "left")  # back to "Все"
+        await pilot.pause()
+        assert table.row_count >= total
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, JournalScreen)
+        await pilot.click("#btn-journal")
+        await pilot.pause(0.4)
+        await pilot.click("#jback")
+        await pilot.pause(0.4)
+        assert not isinstance(app.screen, JournalScreen)
+        await pilot.press("f7")
+        await pilot.pause(0.4)
+        assert isinstance(app.screen, JournalScreen)
+        await pilot.press("f7")  # F7 toggles back
+        await pilot.pause(0.4)
+        assert not isinstance(app.screen, JournalScreen)
+
+
+async def test_journal_error_and_empty_states():
+    runner = DemoRunner(sample=False, jitter=False)
+    app = LinFWApp(Firewall(runner))
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        await pilot.press("f7")
+        await pilot.pause(0.4)
+        status = str(app.screen.query_one("#jstatus").render())
+        assert "Записей нет" in status
+
+        def broken():
+            from linfw.model import FirewallError
+            raise FirewallError("Журнал ядра недоступен: тест")
+        runner.read_journal = broken
+        await app.screen._poll()
+        assert "недоступен" in str(app.screen.query_one("#jstatus").render())

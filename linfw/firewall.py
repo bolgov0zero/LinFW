@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import subprocess
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-from . import persist
-from .model import ACTIONS, CHAINS, OFF_CHAINS, OFF_PREFIX, FirewallError, NewRule, Rule, base_ids, base_specs
+from . import journal, persist
+from .journal import LogEntry
+from .model import (
+    CHAINS,
+    OFF_CHAINS,
+    OFF_PREFIX,
+    ACTIONS,
+    FirewallError,
+    NewRule,
+    Rule,
+    base_ids,
+    base_specs,
+    log_prefix,
+)
 from .parser import Snapshot, parse_save
 
 
@@ -38,10 +50,17 @@ class SystemRunner:
     def persist_info(self) -> Optional[str]:
         return persist.describe()
 
+    def read_journal(self) -> Tuple[str, List[LogEntry]]:
+        return journal.read_entries()
+
 
 class Firewall:
     """Rule operations. Every mutation re-reads the chain first and refuses to
-    act if the rule is no longer where the UI last saw it."""
+    act if the rule is no longer where the UI last saw it.
+
+    A rule with logging on is a *block* of two iptables rules: the hidden LOG
+    twin directly above it, then the rule itself. Every operation below keeps
+    the two together."""
 
     def __init__(self, runner) -> None:
         self.runner = runner
@@ -55,15 +74,22 @@ class Firewall:
     def persist_info(self) -> Optional[str]:
         return self.runner.persist_info()
 
+    def read_journal(self) -> Tuple[str, List[LogEntry]]:
+        return self.runner.read_journal()
+
+    # -- rule operations -------------------------------------------------
+
     def add(self, new: NewRule) -> None:
         new = new.validated()
+        if new.log:
+            self.runner.ipt(["-A", new.chain, *new.to_log_spec()])
         self.runner.ipt(["-A", new.chain, *new.to_spec()])
 
     def edit(self, rule: Rule, new: NewRule) -> None:
         """Replace a rule in place (same chain, same position, same on/off state).
         Counters start from zero since it is, in effect, a different rule."""
-        self._current(rule)
-        self._refuse_base(rule)
+        rules = self._current(rule)
+        self._refuse_hidden(rule)
         new = new.validated()
         if new.chain != rule.chain:
             raise FirewallError("Цепочку существующего правила изменить нельзя")
@@ -71,46 +97,63 @@ class Firewall:
         if not rule.enabled:
             self._ensure_off_chains()
             spec[-1] = OFF_PREFIX + new.action
-        self.runner.ipt(["-R", rule.chain, str(rule.index), *spec])
+        n = rule.index
+        had_twin = self._has_twin(rules, n)
+        self.runner.ipt(["-R", rule.chain, str(n), *spec])
+        if new.log and had_twin:
+            self.runner.ipt(["-R", rule.chain, str(n - 1), *new.to_log_spec(rule.enabled)])
+        elif new.log:
+            self.runner.ipt(["-I", rule.chain, str(n), *new.to_log_spec(rule.enabled)])
+        elif had_twin:
+            self.runner.ipt(["-D", rule.chain, str(n - 1)])
 
     def delete(self, rule: Rule) -> None:
-        self._current(rule)
-        self._refuse_base(rule)
-        self.runner.ipt(["-D", rule.chain, str(rule.index)])
+        rules = self._current(rule)
+        self._refuse_hidden(rule)
+        start = self._block_start(rules, rule.index)
+        for idx in range(rule.index, start - 1, -1):
+            self.runner.ipt(["-D", rule.chain, str(idx)])
 
     def move(self, rule: Rule, delta: int) -> bool:
-        """Move a rule one step up (-1) or down (+1). The copy is inserted
-        before the original is removed, so there is never a gap in the chain."""
+        """Move a rule (with its log twin) one step up (-1) or down (+1). Copies
+        are inserted before the originals are removed, so the chain never has a
+        gap. Counters are carried over."""
         rules = self._current(rule)
-        self._refuse_base(rule)
+        self._refuse_hidden(rule)
         n = rule.index
-        counters = ["-c", str(rule.pkts), str(rule.bytes)]
+        start = self._block_start(rules, n)
+        size = n - start + 1
+        block = [self._with_counters(r) for r in rules[start - 1:n]]
         if delta < 0:
-            # never move a rule above the base rules at the top of the chain
-            if n == 1 or rules[n - 2].hidden:
+            above = start - 1  # last rule of the previous block
+            # never go above the base rules at the top of the chain
+            if above < 1 or rules[above - 1].base_id:
                 return False
-            self._insert(rule.chain, n - 1, len(rules), [*rule.spec, *counters])
-            self.runner.ipt(["-D", rule.chain, str(n + 1)])
+            target = self._block_start(rules, above)
+            self._insert_block(rule.chain, target, len(rules), block)
+            old = range(n + size, start + size - 1, -1)
         else:
             if n == len(rules):
                 return False
-            self._insert(rule.chain, n + 2, len(rules), [*rule.spec, *counters])
-            self.runner.ipt(["-D", rule.chain, str(n)])
+            below = n + 1 if not rules[n].is_log else n + 2  # last rule of the next block
+            self._insert_block(rule.chain, below + 1, len(rules), block)
+            old = range(n, start - 1, -1)
+        for idx in old:
+            self.runner.ipt(["-D", rule.chain, str(idx)])
         return True
 
     def toggle(self, rule: Rule) -> bool:
-        """Enable/disable a rule in place. Returns the new enabled state."""
-        self._current(rule)
-        self._refuse_base(rule)
+        """Enable/disable a rule in place (its log twin follows). Returns the new
+        enabled state."""
+        rules = self._current(rule)
+        self._refuse_hidden(rule)
         action = rule.action.upper()
         if action not in ACTIONS:
             raise FirewallError(f"Правило с действием {action} нельзя выключить")
         spec = list(rule.spec)
-        try:
-            j = next(i for i, t in enumerate(spec) if t in ("-j", "--jump"))
-        except StopIteration:
-            raise FirewallError("У правила нет действия (-j)") from None
-        if rule.enabled:
+        j = self._target_index(spec)
+        enable = not rule.enabled
+        if not enable:
             self._ensure_off_chains()
             spec[j + 1] = OFF_PREFIX + action
             # --reject-with is only valid together with the REJECT target
@@ -119,8 +162,15 @@ class Firewall:
                 del spec[k:k + 2]
         else:
             spec[j + 1] = action
-        self.runner.ipt(["-R", rule.chain, str(rule.index), *spec, "-c", str(rule.pkts), str(rule.bytes)])
-        return not rule.enabled
+        main = ["-R", rule.chain, str(rule.index), *spec, "-c", str(rule.pkts), str(rule.bytes)]
+        if self._has_twin(rules, rule.index):
+            twin = rules[rule.index - 2]
+            twin_spec = self._twin_spec(twin, rule.chain, action, on=enable)
+            self.runner.ipt(
+                ["-R", rule.chain, str(rule.index - 1), *twin_spec, "-c", str(twin.pkts), str(twin.bytes)]
+            )
+        self.runner.ipt(main)
+        return enable
 
     # -- base rules ------------------------------------------------------
 
@@ -128,7 +178,7 @@ class Firewall:
     def _chain_base_ok(chain: str, rules: List[Rule]) -> bool:
         want = base_ids(chain)
         return [r.base_id for r in rules[: len(want)]] == want and not any(
-            r.hidden for r in rules[len(want):]
+            r.base_id for r in rules[len(want):]
         )
 
     def base_ok(self, snap: Snapshot) -> bool:
@@ -147,7 +197,7 @@ class Firewall:
             specs = base_specs(chain)
             for pos, spec in enumerate(specs, start=1):
                 self.runner.ipt(["-I", chain, str(pos), *spec])
-            stale = [r for r in self.snapshot().rules[chain] if r.hidden and r.index > len(specs)]
+            stale = [r for r in self.snapshot().rules[chain] if r.base_id and r.index > len(specs)]
             for r in sorted(stale, key=lambda r: r.index, reverse=True):
                 self.runner.ipt(["-D", chain, str(r.index)])
         return changed
@@ -156,7 +206,7 @@ class Firewall:
         removed = False
         snap = self.snapshot()
         for chain in CHAINS:
-            for r in sorted((r for r in snap.rules[chain] if r.hidden), key=lambda r: r.index, reverse=True):
+            for r in sorted((r for r in snap.rules[chain] if r.base_id), key=lambda r: r.index, reverse=True):
                 self.runner.ipt(["-D", chain, str(r.index)])
                 removed = True
         return removed
@@ -164,9 +214,43 @@ class Firewall:
     # -- helpers ---------------------------------------------------------
 
     @staticmethod
-    def _refuse_base(rule: Rule) -> None:
+    def _refuse_hidden(rule: Rule) -> None:
         if rule.hidden:
-            raise FirewallError("Базовые правила нельзя изменять")
+            raise FirewallError("Служебные правила нельзя изменять")
+
+    @staticmethod
+    def _has_twin(rules: List[Rule], n: int) -> bool:
+        return n >= 2 and rules[n - 2].is_log
+
+    @classmethod
+    def _block_start(cls, rules: List[Rule], n: int) -> int:
+        return n - 1 if cls._has_twin(rules, n) else n
+
+    @staticmethod
+    def _with_counters(rule: Rule) -> List[str]:
+        return [*rule.spec, "-c", str(rule.pkts), str(rule.bytes)]
+
+    @staticmethod
+    def _target_index(spec: List[str]) -> int:
+        try:
+            return next(i for i, t in enumerate(spec) if t in ("-j", "--jump"))
+        except StopIteration:
+            raise FirewallError("У правила нет действия (-j)") from None
+
+    def _twin_spec(self, twin: Rule, chain: str, action: str, on: bool) -> List[str]:
+        spec = list(twin.spec)
+        for opt in ("--log-prefix", "--log-level"):  # only valid with the LOG target
+            while opt in spec:
+                k = spec.index(opt)
+                del spec[k:k + 2]
+        j = self._target_index(spec)
+        del spec[j + 2:]
+        if on:
+            spec[j + 1] = "LOG"
+            spec += ["--log-prefix", log_prefix(chain, action), "--log-level", "4"]
+        else:
+            spec[j + 1] = OFF_PREFIX + "LOG"
+        return spec
 
     def _current(self, rule: Rule) -> List[Rule]:
         rules = self.snapshot().rules[rule.chain]
@@ -174,11 +258,12 @@ class Firewall:
             raise FirewallError("Правила изменились снаружи — список обновлён, повторите действие")
         return rules
 
-    def _insert(self, chain: str, pos: int, count: int, spec: List[str]) -> None:
-        if pos > count:
-            self.runner.ipt(["-A", chain, *spec])
-        else:
-            self.runner.ipt(["-I", chain, str(pos), *spec])
+    def _insert_block(self, chain: str, pos: int, count: int, specs: List[List[str]]) -> None:
+        for k, spec in enumerate(specs):
+            if pos + k > count + k:
+                self.runner.ipt(["-A", chain, *spec])
+            else:
+                self.runner.ipt(["-I", chain, str(pos + k), *spec])
 
     def _ensure_off_chains(self) -> None:
         existing = self.snapshot().chains

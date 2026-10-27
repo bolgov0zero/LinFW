@@ -8,16 +8,21 @@ from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
-from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Label, Static, Tab, Tabs
 
-from . import __version__
 from .firewall import Firewall
 from .model import CHAINS, FirewallError, NewRule, Rule
 from .parser import Snapshot
-from .screens import AddRuleScreen, ConfirmScreen, TemplateScreen, rule_summary
+from .screens import (
+    ACTION_STYLE,
+    AddRuleScreen,
+    ConfirmScreen,
+    JournalScreen,
+    TemplateScreen,
+    ToolButton,
+    rule_summary,
+)
 
-ACTION_STYLE = {"accept": "bold #2ecc71", "drop": "bold #ff5555", "reject": "bold #ff9f1a"}
 POLICY_STYLE = {"ACCEPT": "#2ecc71", "DROP": "#ff5555", "REJECT": "#ff9f1a"}
 COLUMNS = ("#", "Pkts", "chain", "protocol", "source", "destination", "port", "action")
 REFRESH_SECONDS = 2.0
@@ -34,7 +39,7 @@ def humanize(n: int) -> str:
 
 def row_cells(rule: Rule) -> List[Text]:
     dim = "" if rule.enabled else "dim"
-    action = rule.action if rule.enabled else f"{rule.action} (off)"
+    action = rule.action + (" ●" if rule.log else "") + ("" if rule.enabled else " (off)")
     cells = [
         Text(str(rule.number), style=dim, justify="right"),
         Text(humanize(rule.pkts), style=dim, justify="right"),
@@ -46,10 +51,6 @@ def row_cells(rule: Rule) -> List[Text]:
         Text(action, style="dim" if not rule.enabled else ACTION_STYLE.get(rule.action, "bold")),
     ]
     return cells
-
-
-class ToolButton(Button, can_focus=False):
-    """Toolbar buttons never steal focus, so the arrow keys keep driving the table."""
 
 
 class ChainTabs(Tabs, can_focus=False):
@@ -74,9 +75,7 @@ class LinFWApp(App):
     CSS = """
     Screen { background: $surface; }
     #toolbar { height: 1; padding: 0 1; background: $panel; }
-    #toolbar Button { min-width: 0; height: 1; border: none; padding: 0 2; margin-right: 1; }
-    #toolbar .spacer { width: 1fr; }
-    #brand { width: auto; height: 1; color: $accent; text-style: bold; }
+    #toolbar Button { min-width: 0; height: 1; border: none; padding: 0 1; margin-right: 1; }
     #chains { height: 2; }
     #rules { height: 1fr; }
     DataTable { background: $surface; }
@@ -92,14 +91,22 @@ class LinFWApp(App):
     }
     .title { text-style: bold; width: 100%; content-align: center middle; margin-bottom: 1; }
     .hint { color: $text-muted; margin: 1 0; }
-    .row { height: auto; margin-bottom: 1; }
+    .row { height: auto; }
     .label { width: 14; }
     .row Input { width: 1fr; height: 1; border: none; padding: 0 1; background: $boost; }
     .row Input:focus { background: $primary 40%; }
     .row Input:disabled { opacity: 0.4; }
+    .row Checkbox { width: 1fr; height: 1; border: none; padding: 0; background: transparent; }
+    .row Checkbox:focus { background: $primary 40%; }
     .row RadioSet { layout: horizontal; width: 1fr; height: auto; border: none; padding: 0; background: transparent; }
     .row RadioButton { width: auto; padding: 0 2 0 0; background: transparent; }
-    #error { color: $error; height: auto; margin-bottom: 1; }
+    #error { color: $error; height: auto; margin: 1 0; }
+    #jbar { height: 1; padding: 0 1; background: $panel; }
+    #jbar Button { min-width: 0; height: 1; border: none; padding: 0 2; margin-right: 1; }
+    #jbar .spacer { width: 1fr; }
+    #jbar Button.active { background: $accent; color: $text; text-style: bold; }
+    #jtable { height: 1fr; }
+    #jstatus { height: 1; padding: 0 1; background: $panel-darken-1; }
     .buttons { height: 1; align-horizontal: center; }
     .buttons Button { min-width: 0; height: 1; border: none; padding: 0 2; margin: 0 1; }
     .dialog OptionList { height: auto; max-height: 10; border: tall $primary; }
@@ -113,6 +120,7 @@ class LinFWApp(App):
         Binding("f4,u", "move(-1)", "Вверх"),
         Binding("f5,d", "move(1)", "Вниз"),
         Binding("f6,space", "toggle", "Выключить"),
+        Binding("f7,j", "journal", "Журнал"),
         Binding("r", "refresh_now", "Обновить"),
         Binding("q,ctrl+q", "quit", "Выход"),
     ]
@@ -139,8 +147,7 @@ class LinFWApp(App):
             yield ToolButton("F4 ▲ Вверх", id="btn-up")
             yield ToolButton("F5 ▼ Вниз", id="btn-down")
             yield ToolButton("F6 Выкл/Вкл", id="btn-toggle", variant="warning")
-            yield Static("", classes="spacer")
-            yield Static(f"LinFW {__version__}", id="brand")
+            yield ToolButton("F7 Журнал", id="btn-journal", variant="primary")
         yield ChainTabs(*[Tab(name, id=f"tab-{name}") for name in CHAINS], id="chains")
         # "renderable": the green/red/orange action text stays coloured under the cursor
         table = RulesTable(id="rules", cursor_type="row", zebra_stripes=True)
@@ -161,14 +168,18 @@ class LinFWApp(App):
         self.set_interval(REFRESH_SECONDS, self.action_refresh_now)
         self.run_worker(self._refresh())
 
+    def _main(self):
+        """The screen that hosts the rules table (the journal may be on top of it)."""
+        return self.screen_stack[0]
+
     @property
     def table(self) -> RulesTable:
-        return self.query_one("#rules", RulesTable)
+        return self._main().query_one("#rules", RulesTable)
 
     # -- data ------------------------------------------------------------
 
     async def action_refresh_now(self) -> None:
-        if not isinstance(self.screen, ModalScreen):
+        if len(self.screen_stack) == 1:
             await self._refresh()
 
     async def _refresh(self) -> None:
@@ -225,12 +236,12 @@ class LinFWApp(App):
             table.clear()
             for rule in rules:
                 table.add_row(*row_cells(rule), key=rule.key)
-            target = f"{wanted[0]}:{wanted[1]}" if wanted else cursor_key
-            if wanted and target not in new_keys:
-                # the wanted rule is gone (deleted): land on its closest neighbour
+            target = cursor_key
+            if wanted:
+                # wanted = (chain, visible number); if that rule is gone, take its closest neighbour
                 same = [r for r in rules if r.chain == wanted[0]]
                 if same:
-                    target = min(same, key=lambda r: abs(r.index - wanted[1])).key
+                    target = min(same, key=lambda r: abs(r.number - wanted[1])).key
             if target in new_keys:
                 table.move_cursor(row=new_keys.index(target), animate=False)
             table.scroll_y = scroll
@@ -250,7 +261,7 @@ class LinFWApp(App):
 
     def _update_detail(self) -> None:
         rule = self._selected_rule()
-        self.query_one("#detail", Static).update(
+        self._main().query_one("#detail", Static).update(
             Text(rule.describe() if rule else "Правил нет — нажмите F1 или F3", overflow="ellipsis", no_wrap=True)
         )
 
@@ -260,8 +271,8 @@ class LinFWApp(App):
             f"{self.snapshot.policies.get(c, '?')}[/]"
             for c in CHAINS
         )
-        self.query_one("#status", Static).update(
-            f"Policy  {policies}   ·   {self._persist_note}   ·   базовые правила: lo, established   ·   q выход"
+        self._main().query_one("#status", Static).update(
+            f"{policies}   ·   {self._persist_note}   ·   базовые: lo, established   ·   q выход"
         )
 
     @on(DataTable.RowHighlighted)
@@ -280,16 +291,16 @@ class LinFWApp(App):
         self.table.focus()
 
     def action_next_chain(self) -> None:
-        self.query_one(ChainTabs).action_next_tab()
+        self._main().query_one(ChainTabs).action_next_tab()
 
     def action_prev_chain(self) -> None:
-        self.query_one(ChainTabs).action_previous_tab()
+        self._main().query_one(ChainTabs).action_previous_tab()
 
     # -- actions ---------------------------------------------------------
 
     def check_action(self, action: str, parameters: tuple) -> Optional[bool]:
         # the toolbar shortcuts must not fire while a dialog is open
-        if action not in ("quit",) and isinstance(self.screen, ModalScreen):
+        if action not in ("quit",) and len(self.screen_stack) > 1:
             return False
         return True
 
@@ -337,8 +348,8 @@ class LinFWApp(App):
         """Put the cursor on the rule that was just added (best effort)."""
         spec = tuple(new.to_spec())
         for rule in self.snapshot.rules.get(new.chain, []):
-            if rule.spec == spec or rule.spec[: len(spec)] == spec:
-                self._select = (rule.chain, rule.index)
+            if rule.spec == spec:
+                self._select = (rule.chain, rule.number)
                 self._shown = None
                 self._render()
                 return
@@ -364,7 +375,7 @@ class LinFWApp(App):
 
     async def _edit(self, rule: Rule, new: NewRule) -> None:
         if await self._apply("Правило изменено", lambda: self.fw.edit(rule, new)):
-            self._select = (rule.chain, rule.index)
+            self._select = (rule.chain, rule.number)
             self._shown = None
             self._render()
 
@@ -381,9 +392,8 @@ class LinFWApp(App):
         self.push_screen(ConfirmScreen(rule_summary(rule)), done)
 
     async def _delete(self, rule: Rule) -> None:
-        index = max(rule.index - 1, 1)
         if await self._apply("Правило удалено", lambda: self.fw.delete(rule)):
-            self._select = (rule.chain, index)
+            self._select = (rule.chain, max(rule.number - 1, 1))
             self._shown = None
             self._render()
 
@@ -407,9 +417,13 @@ class LinFWApp(App):
             moved.append(self.fw.move(rule, delta))
 
         if await self._apply("Правило перемещено", op) and moved and moved[0]:
-            self._select = (rule.chain, rule.index + delta)
+            self._select = (rule.chain, rule.number + delta)
             self._shown = None
             self._render()
+
+    @on(Button.Pressed, "#btn-journal")
+    def action_journal(self) -> None:
+        self.push_screen(JournalScreen(self.fw))
 
     @on(Button.Pressed, "#btn-toggle")
     def action_toggle(self) -> None:

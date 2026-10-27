@@ -128,5 +128,6 @@ def parse_save(text: str) -> Snapshot:
         for i, rule in enumerate(rules):
             if not rule.hidden:
                 shown += 1
-                rules[i] = replace(rule, number=shown)
+                twin = i > 0 and rules[i - 1].is_log
+                rules[i] = replace(rule, number=shown, log=twin)
     return snap
