@@ -17,7 +17,6 @@ from .model import CHAINS, FirewallError, NewRule, Rule
 from .parser import Snapshot
 from .screens import AddRuleScreen, ConfirmScreen, TemplateScreen, rule_summary
 
-TABS = ("ALL",) + CHAINS
 ACTION_STYLE = {"accept": "bold #2ecc71", "drop": "bold #ff5555", "reject": "bold #ff9f1a"}
 POLICY_STYLE = {"ACCEPT": "#2ecc71", "DROP": "#ff5555", "REJECT": "#ff9f1a"}
 COLUMNS = ("#", "Pkts", "chain", "protocol", "source", "destination", "port", "action")
@@ -122,7 +121,7 @@ class LinFWApp(App):
         super().__init__()
         self.fw = firewall
         self.snapshot = Snapshot()
-        self.current = "ALL"
+        self.current = CHAINS[0]
         # None = the table no longer matches what was drawn last (e.g. after a tab switch): redraw
         self._shown: Optional[List[Rule]] = None
         self._select: Optional[Tuple[str, int]] = None
@@ -142,7 +141,7 @@ class LinFWApp(App):
             yield ToolButton("F6 Выкл/Вкл", id="btn-toggle", variant="warning")
             yield Static("", classes="spacer")
             yield Static(f"LinFW {__version__}", id="brand")
-        yield ChainTabs(*[Tab(name, id=f"tab-{name}") for name in TABS], id="chains")
+        yield ChainTabs(*[Tab(name, id=f"tab-{name}") for name in CHAINS], id="chains")
         # "renderable": the green/red/orange action text stays coloured under the cursor
         table = RulesTable(id="rules", cursor_type="row", zebra_stripes=True)
         table.cursor_foreground_priority = "renderable"
@@ -203,8 +202,7 @@ class LinFWApp(App):
         self.notify("Базовые правила (loopback, established/related) применены")
 
     def _visible(self) -> List[Rule]:
-        chains = CHAINS if self.current == "ALL" else (self.current,)
-        return [r for c in chains for r in self.snapshot.rules.get(c, []) if not r.hidden]
+        return [r for r in self.snapshot.rules.get(self.current, []) if not r.hidden]
 
     def _render(self) -> None:
         table = self.table
@@ -274,7 +272,7 @@ class LinFWApp(App):
 
     @on(Tabs.TabActivated)
     def _tab_activated(self, event: Tabs.TabActivated) -> None:
-        name = (event.tab.id or "tab-ALL")[4:]
+        name = (event.tab.id or f"tab-{CHAINS[0]}")[4:]
         if name != self.current:
             self.current = name
             self._shown = None
@@ -316,13 +314,12 @@ class LinFWApp(App):
 
     @on(Button.Pressed, "#btn-add")
     def action_add(self) -> None:
-        chain = self.current if self.current in CHAINS else "INPUT"
 
         def done(rule: Optional[NewRule]) -> None:
             if rule:
                 self.run_worker(self._add(rule, "Правило добавлено"))
 
-        self.push_screen(AddRuleScreen(chain), done)
+        self.push_screen(AddRuleScreen(self.current), done)
 
     @on(Button.Pressed, "#btn-template")
     def action_template(self) -> None:

@@ -11,7 +11,7 @@ def make_app():
     return LinFWApp(Firewall(runner)), runner
 
 
-async def test_table_columns_and_tabs():
+async def test_table_columns_and_chain_tabs():
     app, _ = make_app()
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.pause()
@@ -19,21 +19,26 @@ async def test_table_columns_and_tabs():
         assert [str(c.label) for c in table.columns.values()] == [
             "#", "Pkts", "chain", "protocol", "source", "destination", "port", "action",
         ]
-        assert table.row_count == 10  # the hidden base rules are not listed
-        await pilot.press("right")  # ALL -> INPUT
+        tabs = app.query_one(Tabs)
+        assert [t.id for t in tabs.query("Tab")] == ["tab-INPUT", "tab-OUTPUT", "tab-FORWARD"]  # no ALL
+        assert tabs.active == "tab-INPUT"
+        assert table.row_count == 6  # hidden base rules are not listed
+        assert {str(table.get_row_at(i)[2]) for i in range(table.row_count)} == {"input"}
+        await pilot.press("right")
         await pilot.pause()
-        assert app.query_one(Tabs).active == "tab-INPUT"
-        assert table.row_count == 6
-        await pilot.press("right", "right")
+        assert tabs.active == "tab-OUTPUT" and table.row_count == 2
+        assert {str(table.get_row_at(i)[2]) for i in range(table.row_count)} == {"output"}
+        await pilot.press("right")
         await pilot.pause()
-        assert table.row_count == 2  # FORWARD
+        assert tabs.active == "tab-FORWARD" and table.row_count == 2
+        await pilot.press("right")  # no wrap-around surprises: stays a valid chain tab
+        await pilot.pause()
+        assert tabs.active in ("tab-INPUT", "tab-FORWARD")
 
 
 async def test_toolbar_keys_add_delete_toggle_move():
     app, runner = make_app()
     async with app.run_test(size=(120, 36)) as pilot:
-        await pilot.pause()
-        await pilot.press("right")  # INPUT tab
         await pilot.pause()
         table = app.query_one(DataTable)
         saved = runner.persist_calls
@@ -131,8 +136,8 @@ async def test_switching_to_an_empty_chain_clears_the_table():
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.pause()
         table = app.query_one(DataTable)
-        assert table.row_count == 1  # ALL
-        await pilot.press("right", "right")  # OUTPUT: no rules
+        assert table.row_count == 1  # INPUT
+        await pilot.press("right")  # OUTPUT: no visible rules (only the hidden base ones)
         await pilot.pause()
         assert table.row_count == 0
         await pilot.press("left")  # INPUT
@@ -144,9 +149,7 @@ async def test_double_click_and_enter_open_the_editor():
     app, runner = make_app()
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.pause()
-        await pilot.press("right")  # INPUT: visible #1 ssh, #2 web
-        await pilot.pause()
-        table = app.query_one(DataTable)
+        table = app.query_one(DataTable)  # INPUT: visible #1 ssh, #2 web
         # header is line 0, so rows start at y=1: double click the second row
         await pilot.click(DataTable, offset=(10, 2), times=2)
         await pilot.pause()
