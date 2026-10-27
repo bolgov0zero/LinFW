@@ -4,7 +4,7 @@ import subprocess
 from typing import List, Optional
 
 from . import persist
-from .model import ACTIONS, OFF_CHAINS, OFF_PREFIX, FirewallError, NewRule, Rule
+from .model import ACTIONS, CHAINS, OFF_CHAINS, OFF_PREFIX, FirewallError, NewRule, Rule, base_ids, base_specs
 from .parser import Snapshot, parse_save
 
 
@@ -61,16 +61,19 @@ class Firewall:
 
     def delete(self, rule: Rule) -> None:
         self._current(rule)
+        self._refuse_base(rule)
         self.runner.ipt(["-D", rule.chain, str(rule.index)])
 
     def move(self, rule: Rule, delta: int) -> bool:
         """Move a rule one step up (-1) or down (+1). The copy is inserted
         before the original is removed, so there is never a gap in the chain."""
         rules = self._current(rule)
+        self._refuse_base(rule)
         n = rule.index
         counters = ["-c", str(rule.pkts), str(rule.bytes)]
         if delta < 0:
-            if n == 1:
+            # never move a rule above the base rules at the top of the chain
+            if n == 1 or rules[n - 2].hidden:
                 return False
             self._insert(rule.chain, n - 1, len(rules), [*rule.spec, *counters])
             self.runner.ipt(["-D", rule.chain, str(n + 1)])
@@ -84,6 +87,7 @@ class Firewall:
     def toggle(self, rule: Rule) -> bool:
         """Enable/disable a rule in place. Returns the new enabled state."""
         self._current(rule)
+        self._refuse_base(rule)
         action = rule.action.upper()
         if action not in ACTIONS:
             raise FirewallError(f"Правило с действием {action} нельзя выключить")
@@ -104,7 +108,51 @@ class Firewall:
         self.runner.ipt(["-R", rule.chain, str(rule.index), *spec, "-c", str(rule.pkts), str(rule.bytes)])
         return not rule.enabled
 
+    # -- base rules ------------------------------------------------------
+
+    @staticmethod
+    def _chain_base_ok(chain: str, rules: List[Rule]) -> bool:
+        want = base_ids(chain)
+        return [r.base_id for r in rules[: len(want)]] == want and not any(
+            r.hidden for r in rules[len(want):]
+        )
+
+    def base_ok(self, snap: Snapshot) -> bool:
+        return all(self._chain_base_ok(c, snap.rules[c]) for c in CHAINS)
+
+    def ensure_base(self) -> bool:
+        """Put the base rules (loopback, established/related) at the top of every
+        chain. Returns True if anything had to be changed. New copies go in
+        before stale ones are removed, so traffic is never left unprotected."""
+        snap = self.snapshot()
+        changed = False
+        for chain in CHAINS:
+            if self._chain_base_ok(chain, snap.rules[chain]):
+                continue
+            changed = True
+            specs = base_specs(chain)
+            for pos, spec in enumerate(specs, start=1):
+                self.runner.ipt(["-I", chain, str(pos), *spec])
+            stale = [r for r in self.snapshot().rules[chain] if r.hidden and r.index > len(specs)]
+            for r in sorted(stale, key=lambda r: r.index, reverse=True):
+                self.runner.ipt(["-D", chain, str(r.index)])
+        return changed
+
+    def remove_base(self) -> bool:
+        removed = False
+        snap = self.snapshot()
+        for chain in CHAINS:
+            for r in sorted((r for r in snap.rules[chain] if r.hidden), key=lambda r: r.index, reverse=True):
+                self.runner.ipt(["-D", chain, str(r.index)])
+                removed = True
+        return removed
+
     # -- helpers ---------------------------------------------------------
+
+    @staticmethod
+    def _refuse_base(rule: Rule) -> None:
+        if rule.hidden:
+            raise FirewallError("Базовые правила нельзя изменять")
 
     def _current(self, rule: Rule) -> List[Rule]:
         rules = self.snapshot().rules[rule.chain]

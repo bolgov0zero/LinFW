@@ -12,15 +12,12 @@ from typing import Dict, List, Optional, Tuple
 from .model import CHAINS, FirewallError
 
 _SAMPLE = [
-    ("INPUT", "-i lo -j ACCEPT", 4210),
-    ("INPUT", "-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT", 982341),
     ("INPUT", "-p tcp --dport 22 -j ACCEPT", 1532),
     ("INPUT", "-p tcp -m multiport --dports 80,443 -j ACCEPT", 20871),
     ("INPUT", "-p icmp -j ACCEPT", 87),
     ("INPUT", "-s 203.0.113.0/24 -j DROP", 311),
     ("INPUT", "-p udp --dport 161 -s 10.0.0.0/8 -j REJECT --reject-with icmp-port-unreachable", 12),
     ("INPUT", "-j DROP", 5400),
-    ("OUTPUT", "-o lo -j ACCEPT", 4210),
     ("OUTPUT", "-p tcp -d 198.51.100.7 --dport 25 -j DROP", 3),
     ("OUTPUT", "-j ACCEPT", 120442),
     ("FORWARD", "-s 192.168.1.0/24 -d 10.10.0.0/16 -j ACCEPT", 9120),

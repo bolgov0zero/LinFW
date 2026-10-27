@@ -3,7 +3,7 @@ from __future__ import annotations
 import ipaddress
 import shlex
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 CHAINS = ("INPUT", "OUTPUT", "FORWARD")
 PROTOCOLS = ("all", "tcp", "udp", "icmp")
@@ -14,6 +14,29 @@ ACTIONS = ("ACCEPT", "DROP", "REJECT")
 # evaluated against the next rule. One chain per action remembers the original.
 OFF_PREFIX = "LINFW_OFF_"
 OFF_CHAINS = tuple(OFF_PREFIX + a for a in ACTIONS)
+
+
+# Base rules: always on top of the chain, never shown in the table and never
+# editable. Every one of them carries a comment "linfw:base:<id>" that is how
+# we recognise (and restore) them.
+BASE_TAG = "linfw:base"
+_ESTABLISHED = ["-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED"]
+BASE_RULES = {
+    "INPUT": [("lo", ["-i", "lo"]), ("est", _ESTABLISHED)],
+    "OUTPUT": [("lo", ["-o", "lo"]), ("est", _ESTABLISHED)],
+    "FORWARD": [("est", _ESTABLISHED)],
+}
+
+
+def base_ids(chain: str) -> List[str]:
+    return [f"{BASE_TAG}:{name}" for name, _ in BASE_RULES[chain]]
+
+
+def base_specs(chain: str) -> List[List[str]]:
+    return [
+        [*match, "-m", "comment", "--comment", f"{BASE_TAG}:{name}", "-j", "ACCEPT"]
+        for name, match in BASE_RULES[chain]
+    ]
 
 
 class FirewallError(Exception):
@@ -34,10 +57,22 @@ class Rule:
     enabled: bool
     spec: Tuple[str, ...]  # tokens after "-A CHAIN", used to re-issue the rule
     extra: Tuple[str, ...] = ()  # matches that have no column of their own
+    number: int = 0  # position shown to the user: base rules are not counted
 
     @property
     def key(self) -> str:
         return f"{self.chain}:{self.index}"
+
+    @property
+    def base_id(self) -> Optional[str]:
+        for i, tok in enumerate(self.spec[:-1]):
+            if tok == "--comment" and self.spec[i + 1].startswith(BASE_TAG + ":"):
+                return self.spec[i + 1]
+        return None
+
+    @property
+    def hidden(self) -> bool:
+        return self.base_id is not None
 
     def describe(self) -> str:
         return shlex.join(["-A", self.chain, *self.spec])

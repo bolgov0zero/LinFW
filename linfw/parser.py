@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Sequence, Set
 
 from .model import CHAINS, OFF_PREFIX, Rule
@@ -123,4 +123,10 @@ def parse_save(text: str) -> Snapshot:
             continue
         rules = snap.rules[tokens[1]]
         rules.append(parse_rule(tokens[1], len(rules) + 1, pkts, nbytes, tokens[2:]))
+    for rules in snap.rules.values():
+        shown = 0
+        for i, rule in enumerate(rules):
+            if not rule.hidden:
+                shown += 1
+                rules[i] = replace(rule, number=shown)
     return snap

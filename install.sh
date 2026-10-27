@@ -34,6 +34,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if [ "${1:-}" = "--uninstall" ]; then
+  [ -x "$PREFIX/bin/linfw" ] && { "$PREFIX/bin/linfw" --remove-base || warn "не удалось удалить базовые правила"; }
   rm -rf "$PREFIX"
   [ -L "$LINK" ] && rm -f "$LINK"
   say "LinFW удалён. Сохранённые правила iptables и пакеты автозагрузки не тронуты."
@@ -108,7 +109,12 @@ fi
 
 ln -sf "$PREFIX/bin/linfw" "$LINK"
 
-# --- 3. done ---------------------------------------------------------------
+# --- 3. base rules ---------------------------------------------------------
+# loopback + established/related on top of every chain, hidden in the UI
+say "Применяю базовые правила (loopback, established/related)"
+"$PREFIX/bin/linfw" --apply-base || warn "не удалось применить базовые правила; LinFW повторит попытку при запуске"
+
+# --- 4. done ---------------------------------------------------------------
 say "Готово. Запуск: linfw"
 if [ -n "$PERSIST" ]; then
   say "Правила сохраняются автоматически (${PERSIST})."

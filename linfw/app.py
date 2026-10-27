@@ -37,7 +37,7 @@ def row_cells(rule: Rule) -> List[Text]:
     dim = "" if rule.enabled else "dim"
     action = rule.action if rule.enabled else f"{rule.action} (off)"
     cells = [
-        Text(str(rule.index), style=dim, justify="right"),
+        Text(str(rule.number), style=dim, justify="right"),
         Text(humanize(rule.pkts), style=dim, justify="right"),
         Text(rule.chain.lower(), style=dim),
         Text(rule.protocol, style=dim),
@@ -121,6 +121,7 @@ class LinFWApp(App):
         self._select: Optional[Tuple[str, int]] = None
         self._lock = asyncio.Lock()
         self._persist_note = ""
+        self._base_failed = False
 
     # -- layout ----------------------------------------------------------
 
@@ -173,11 +174,30 @@ class LinFWApp(App):
             except FirewallError as exc:
                 self.notify(str(exc), severity="error", timeout=8)
                 return
+            await self._ensure_base()
         self._render()
+
+    async def _ensure_base(self) -> None:
+        """Restore the hidden base rules if they are missing or not on top.
+        Called with the lock held. After one failure it stops retrying."""
+        if self._base_failed or self.fw.base_ok(self.snapshot):
+            return
+        try:
+            await asyncio.to_thread(self.fw.ensure_base)
+        except FirewallError as exc:
+            self._base_failed = True
+            self.notify(f"Базовые правила не применены: {exc}", severity="error", timeout=10)
+            return
+        try:
+            await asyncio.to_thread(self.fw.persist)
+        except FirewallError as exc:
+            self.notify(str(exc), severity="warning", timeout=8)
+        self.snapshot = await asyncio.to_thread(self.fw.snapshot)
+        self.notify("Базовые правила (loopback, established/related) применены")
 
     def _visible(self) -> List[Rule]:
         chains = CHAINS if self.current == "ALL" else (self.current,)
-        return [r for c in chains for r in self.snapshot.rules.get(c, [])]
+        return [r for c in chains for r in self.snapshot.rules.get(c, []) if not r.hidden]
 
     def _render(self) -> None:
         table = self.table
@@ -201,6 +221,11 @@ class LinFWApp(App):
             for rule in rules:
                 table.add_row(*row_cells(rule), key=rule.key)
             target = f"{wanted[0]}:{wanted[1]}" if wanted else cursor_key
+            if wanted and target not in new_keys:
+                # the wanted rule is gone (deleted): land on its closest neighbour
+                same = [r for r in rules if r.chain == wanted[0]]
+                if same:
+                    target = min(same, key=lambda r: abs(r.index - wanted[1])).key
             if target in new_keys:
                 table.move_cursor(row=new_keys.index(target), animate=False)
             table.scroll_y = scroll
@@ -231,7 +256,7 @@ class LinFWApp(App):
             for c in CHAINS
         )
         self.query_one("#status", Static).update(
-            f"Policy  {policies}   ·   {self._persist_note}   ·   ←→ цепочки  ↑↓ строки  q выход"
+            f"Policy  {policies}   ·   {self._persist_note}   ·   базовые правила: lo, established   ·   q выход"
         )
 
     @on(DataTable.RowHighlighted)

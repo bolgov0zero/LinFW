@@ -71,7 +71,9 @@ def test_new_rule_invalid(kwargs):
 
 @pytest.fixture
 def fw():
-    return Firewall(DemoRunner(jitter=False))
+    fw = Firewall(DemoRunner(jitter=False))
+    fw.ensure_base()  # what the app does on start
+    return fw
 
 
 def actions(fw, chain):
@@ -91,7 +93,7 @@ def test_add_always_appends_to_the_end(fw):
 
 def test_delete_and_stale_rule(fw):
     snap = fw.snapshot()
-    victim, other = snap.rules["INPUT"][2], snap.rules["INPUT"][0]
+    victim, other = snap.rules["INPUT"][3], snap.rules["INPUT"][2]  # other sits above: unaffected
     fw.delete(victim)
     assert len(fw.snapshot().rules["INPUT"]) == len(snap.rules["INPUT"]) - 1
     with pytest.raises(FirewallError):
@@ -101,21 +103,22 @@ def test_delete_and_stale_rule(fw):
 
 def test_move_keeps_counters_and_edges(fw):
     rules = fw.snapshot().rules["INPUT"]
-    ssh = rules[2]
-    assert fw.move(ssh, -1)
+    web = rules[3]  # real index 4: two hidden base rules + ssh come first
+    assert fw.move(web, -1)
     moved = fw.snapshot().rules["INPUT"]
-    assert moved[1].spec == ssh.spec and moved[1].pkts == ssh.pkts
+    assert moved[2].spec == web.spec and moved[2].pkts == web.pkts
     assert len(moved) == len(rules)
-    assert fw.move(moved[1], 1)
+    assert fw.move(moved[2], 1)
     assert [r.spec for r in fw.snapshot().rules["INPUT"]] == [r.spec for r in rules]
-    assert not fw.move(fw.snapshot().rules["INPUT"][0], -1)
+    # the first visible rule cannot go above the base rules, the last cannot go down
+    assert not fw.move(fw.snapshot().rules["INPUT"][2], -1)
     assert not fw.move(fw.snapshot().rules["INPUT"][-1], 1)
 
 
 def test_move_down_to_last_position(fw):
     rules = fw.snapshot().rules["FORWARD"]
-    assert fw.move(rules[0], 1)
-    assert fw.snapshot().rules["FORWARD"][-1].spec == rules[0].spec
+    assert fw.move(rules[1], 1)  # rules[0] is the hidden base rule
+    assert fw.snapshot().rules["FORWARD"][-1].spec == rules[1].spec
 
 
 def test_toggle_roundtrip(fw):
@@ -134,11 +137,11 @@ def test_disabled_rules_keep_their_position(fw):
     order = lambda: [(r.index, r.action) for r in fw.snapshot().rules["INPUT"]]  # noqa: E731
     before = order()
     for rule in fw.snapshot().rules["INPUT"]:
-        if rule.action in ("accept", "drop", "reject"):
+        if not rule.hidden and rule.action in ("accept", "drop", "reject"):
             fw.toggle(fw.snapshot().rules["INPUT"][rule.index - 1])
-    after = fw.snapshot().rules["INPUT"]
+    after = [r for r in fw.snapshot().rules["INPUT"] if not r.hidden]
     assert order() == before
-    assert [r.enabled for r in after if r.action in ("accept", "drop", "reject")] == [False] * 8
+    assert len(after) == 6 and not any(r.enabled for r in after)
 
 
 def test_toggle_unsupported_target():
@@ -147,3 +150,53 @@ def test_toggle_unsupported_target():
     fw = Firewall(runner)
     with pytest.raises(FirewallError):
         fw.toggle(fw.snapshot().rules["FORWARD"][0])
+
+
+# -- base rules ------------------------------------------------------------
+
+
+def test_base_rules_are_hidden_numbered_and_on_top(fw):
+    snap = fw.snapshot()
+    inp = snap.rules["INPUT"]
+    assert [r.base_id for r in inp[:2]] == ["linfw:base:lo", "linfw:base:est"]
+    assert [r.hidden for r in inp[:3]] == [True, True, False]
+    assert [r.number for r in inp if not r.hidden][:2] == [1, 2]  # numbering skips them
+    assert snap.rules["OUTPUT"][0].hidden and snap.rules["FORWARD"][0].hidden
+    assert len(snap.rules["FORWARD"][0].spec) and "conntrack" in snap.rules["FORWARD"][0].spec
+
+
+def test_ensure_base_is_idempotent(fw):
+    before = [r.spec for r in fw.snapshot().rules["INPUT"]]
+    assert fw.base_ok(fw.snapshot()) and not fw.ensure_base()
+    assert [r.spec for r in fw.snapshot().rules["INPUT"]] == before
+
+
+def test_ensure_base_restores_missing_and_misplaced():
+    runner = DemoRunner(jitter=False)
+    fw = Firewall(runner)
+    assert not fw.base_ok(fw.snapshot()) and fw.ensure_base()
+    user_rules = [r.spec for r in fw.snapshot().rules["INPUT"] if not r.hidden]
+
+    # someone flushed one base rule and put a foreign rule on top of another
+    del runner.rules["INPUT"][1]
+    runner.rules["INPUT"].insert(0, [0, 0, ["-s", "9.9.9.9", "-j", "DROP"]])
+    assert not fw.base_ok(fw.snapshot()) and fw.ensure_base()
+    inp = fw.snapshot().rules["INPUT"]
+    assert [r.base_id for r in inp[:2]] == ["linfw:base:lo", "linfw:base:est"]
+    assert sum(r.hidden for r in inp) == 2  # no duplicates left behind
+    assert [r.spec for r in inp if not r.hidden][0] == ("-s", "9.9.9.9", "-j", "DROP")
+    assert [r.spec for r in inp if not r.hidden][1:] == user_rules
+
+
+def test_base_rules_cannot_be_changed(fw):
+    base = fw.snapshot().rules["INPUT"][0]
+    for op in (fw.delete, fw.toggle, lambda r: fw.move(r, 1)):
+        with pytest.raises(FirewallError):
+            op(base)
+
+
+def test_remove_base(fw):
+    assert fw.remove_base()
+    snap = fw.snapshot()
+    assert not any(r.hidden for rules in snap.rules.values() for r in rules)
+    assert not fw.remove_base()
