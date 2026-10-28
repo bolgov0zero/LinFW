@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/bolgov0zero/LinFW/main/install.sh |
 curl -fsSL https://raw.githubusercontent.com/bolgov0zero/LinFW/main/install.sh | bash
 ```
 
-Установщик:
+Установщик очищает экран и показывает только шаги (со спиннером и галочкой, замечания жёлтым); весь вывод `apt`/`pip` идёт в лог, который показывается, только если шаг упал. `NO_COLOR=1` отключает цвета. Он:
 
 - ставит `python3`, `iptables` и пакет, который восстанавливает правила при загрузке
   (Debian/Ubuntu — `iptables-persistent`, RHEL/Fedora — `iptables-services`, Arch — `iptables.service`, Alpine — `iptables` в OpenRC);
