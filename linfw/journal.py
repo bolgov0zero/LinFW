@@ -139,9 +139,9 @@ def parse_line(line: str) -> Optional[LogEntry]:
     )
 
 
-def parse_text(text: str) -> List[LogEntry]:
+def parse_text(text: str, limit: int = MAX_ENTRIES) -> List[LogEntry]:
     entries = [e for e in map(parse_line, (ln for ln in text.splitlines() if LOG_PREFIX + ":" in ln)) if e]
-    return entries[-MAX_ENTRIES:]
+    return entries[-limit:]
 
 
 def _run(argv: List[str]) -> Optional[str]:
@@ -168,38 +168,40 @@ def _tail(path: str, nbytes: int = 2_000_000, whole_lines: bool = False) -> Opti
 
 
 def _from_kernel_log(
-    read: Callable[[], Optional[str]], chain: Optional[str], actions: Optional[FrozenSet[str]]
+    read: Callable[[], Optional[str]], chain: Optional[str], actions: Optional[FrozenSet[str]], limit: int
 ) -> Callable[[], Optional[List[LogEntry]]]:
     def reader() -> Optional[List[LogEntry]]:
         text = read()
         if text is None:
             return None
-        return [e for e in parse_text(text) if _wanted(e, chain, actions)]
+        return [e for e in parse_text(text, limit) if _wanted(e, chain, actions)]
 
     return reader
 
 
-def _sources(chain: Optional[str], actions: Optional[FrozenSet[str]]):
+def _sources(chain: Optional[str], actions: Optional[FrozenSet[str]], limit: int):
     """Candidate (name, reader) pairs, most likely first. A reader returns entries or None."""
-    yield "linfw-logd", lambda: read_hits(HITS_DIR, chain, actions=actions)
+    yield "linfw-logd", lambda: read_hits(HITS_DIR, chain, limit, actions)
     journalctl = persist.find_binary("journalctl")
     if journalctl:
         yield "journalctl -k", _from_kernel_log(
-            lambda: _run([journalctl, "-k", "-o", "short-iso", "--no-pager", "-q", "-n", "20000"]), chain, actions
+            lambda: _run([journalctl, "-k", "-o", "short-iso", "--no-pager", "-q", "-n", "20000"]), chain, actions, limit
         )
     for path in _LOG_FILES:
-        yield path, _from_kernel_log(lambda p=path: _tail(p, 4_000_000), chain, actions)
+        yield path, _from_kernel_log(lambda p=path: _tail(p, 4_000_000), chain, actions, limit)
     dmesg = persist.find_binary("dmesg")
     if dmesg:
-        yield "dmesg", _from_kernel_log(lambda: _run([dmesg, "-T"]), chain, actions)
+        yield "dmesg", _from_kernel_log(lambda: _run([dmesg, "-T"]), chain, actions, limit)
 
 
-def read_entries(chain: Optional[str] = None, actions: Optional[FrozenSet[str]] = None) -> Tuple[str, List[LogEntry]]:
+def read_entries(
+    chain: Optional[str] = None, actions: Optional[FrozenSet[str]] = None, limit: int = MAX_ENTRIES
+) -> Tuple[str, List[LogEntry]]:
     """Return (source name, entries oldest-first), optionally only one chain and/or
     only some actions ("accept", "drop", "reject"; the two filters are independent).
     Sources are tried in turn and the first one that has records wins."""
     first_readable = ""
-    for name, read in _sources(chain, actions):
+    for name, read in _sources(chain, actions, limit):
         entries = read()
         if entries is None:
             continue

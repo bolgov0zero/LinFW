@@ -52,8 +52,8 @@ class SystemRunner:
     def persist_info(self) -> Optional[str]:
         return persist.describe()
 
-    def read_journal(self, chain: Optional[str] = None, actions=None) -> Tuple[str, List[LogEntry]]:
-        return journal.read_entries(chain, actions)
+    def read_journal(self, chain: Optional[str] = None, actions=None, limit: int = journal.MAX_ENTRIES) -> Tuple[str, List[LogEntry]]:
+        return journal.read_entries(chain, actions, limit)
 
     def logd_state(self) -> Optional[str]:
         """systemd's view of linfw-logd ("active", "inactive", "failed" ...), None without systemd."""
@@ -88,8 +88,8 @@ class Firewall:
     def persist_info(self) -> Optional[str]:
         return self.runner.persist_info()
 
-    def read_journal(self, chain: Optional[str] = None, actions=None) -> Tuple[str, List[LogEntry]]:
-        return self.runner.read_journal(chain, actions)
+    def read_journal(self, chain: Optional[str] = None, actions=None, limit: int = journal.MAX_ENTRIES) -> Tuple[str, List[LogEntry]]:
+        return self.runner.read_journal(chain, actions, limit)
 
     def counter_totals(self, snap: Snapshot) -> Dict[str, Tuple[int, int]]:
         """{"CHAIN:index": (packets, bytes)} counted since the rule was first seen,

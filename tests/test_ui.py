@@ -278,11 +278,11 @@ async def test_journal_error_and_empty_states():
         status = str(app.screen.query_one("#jstatus").render())
         assert "Записей нет" in status
 
-        def broken(chain=None, actions=None):
+        def broken(chain=None, actions=None, limit=None):
             from linfw.model import FirewallError
             raise FirewallError("Журнал ядра недоступен: тест")
         runner.read_journal = broken
-        await app.screen._poll()
+        await app.screen._load()
         assert "недоступен" in str(app.screen.query_one("#jstatus").render())
 
 
@@ -298,18 +298,18 @@ async def test_empty_journal_explains_why():
         assert "не включён ни у одного правила" in status()
 
         fw.add(NewRule("INPUT", "tcp", "DROP", port="22", log=True))
-        await app.screen._poll()
+        await app.screen._load()
         assert "ещё ни разу не сработали" in status()
 
         for entry in runner.rules["INPUT"]:
             if "NFLOG" in entry[2]:
                 entry[0] = 3
         runner.logd_state = lambda: "failed"
-        await app.screen._poll()
+        await app.screen._load()
         text = status()
         assert "правила сработали (3 пакетов)" in text and "состояние: failed" in text and "linfw-logd" in text
         runner.logd_state = lambda: "active"
-        await app.screen._poll()
+        await app.screen._load()
         assert "nfnetlink_log" in status()
 
 
@@ -402,34 +402,55 @@ async def test_template_dialog_button_and_click():
         assert not isinstance(app.screen, TemplateScreen)
 
 
-async def test_open_journal_picks_up_new_records_by_itself():
+async def test_open_journal_never_changes_by_itself():
     from linfw.journal import LogEntry
 
     runner = DemoRunner(sample=False, jitter=False)
-    fw = Firewall(runner)
-    app = LinFWApp(fw)
+    app = LinFWApp(Firewall(runner))
+    new = lambda n, chain="INPUT": LogEntry(f"2026-10-28 12:00:{n:02d}", chain, "drop", "tcp", f"1.1.1.{n}", "2.2.2.2", "22")  # noqa: E731
+    runner._hits.append(new(1))
     async with app.run_test(size=(140, 36)) as pilot:
         await pilot.pause()
         await pilot.press("f7")
         await pilot.pause(0.5)
-        table = app.screen.query_one("#jtable", DataTable)
-        assert table.row_count == 0
-        status = lambda: str(app.screen.query_one("#jstatus").render())  # noqa: E731
-        assert "обновлено " in status()
+        screen = app.screen
+        table = screen.query_one("#jtable", DataTable)
+        status = lambda: str(screen.query_one("#jstatus").render())  # noqa: E731
+        assert table.row_count == 1 and "данные на " in status()  # the snapshot taken on open
 
-        runner._hits.append(LogEntry("2026-10-28 12:00:00", "INPUT", "drop", "tcp", "1.1.1.1", "2.2.2.2", "22"))
-        await pilot.pause(2.6)  # no key, no click: the periodic read must find it
-        assert table.row_count == 1
-        runner._hits.append(LogEntry("2026-10-28 12:00:05", "OUTPUT", "accept", "udp", "3.3.3.3", "8.8.8.8", "53"))
-        await pilot.pause(2.6)
-        assert table.row_count == 2 and str(table.get_row_at(0)[3]) == "3.3.3.3"  # newest on top
+        reads = []
+        original = runner.read_journal
+        runner.read_journal = lambda *a, **k: reads.append(a) or original(*a, **k)
+        runner._hits.append(new(2))
+        await pilot.pause(6)  # long enough for several of the old automatic refreshes
+        assert table.row_count == 1 and not reads  # no new records, and nothing was even read
 
-        runner._hits.append(LogEntry("2026-10-28 12:00:09", "INPUT", "reject", "tcp", "4.4.4.4", "5.5.5.5", "80"))
-        await pilot.press("f5")  # manual refresh is immediate
+        await pilot.click("#jf-OUTPUT")  # the filters re-sort the snapshot, they do not re-read
+        await pilot.click("#jf-INPUT")
+        await pilot.click("#ja-drop")
+        await pilot.pause(0.5)
+        assert table.row_count == 1 and not reads  # still the record that was loaded, not the new one
+        assert [str(c) for c in table.get_row_at(0)][3] == "1.1.1.1"
+
+        await pilot.click("#jrefresh")  # «Обновить» takes a new snapshot
         await pilot.pause()
         await app.workers.wait_for_complete()
         await pilot.pause()
-        assert table.row_count == 3
+        assert table.row_count == 2 and len(reads) == 1
+
+        runner._hits.append(new(3))
+        await pilot.press("f5")  # so does F5
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert table.row_count == 3 and len(reads) == 2
+
+        runner._hits.append(new(4))
+        await pilot.press("escape")  # leaving and reopening reads again
+        await pilot.pause(0.4)
+        await pilot.press("f7")
+        await pilot.pause(0.6)
+        assert app.screen.query_one("#jtable", DataTable).row_count == 4
 
 
 async def test_journal_action_filters_are_independent_of_the_chain():

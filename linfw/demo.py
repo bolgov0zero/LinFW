@@ -121,11 +121,12 @@ class DemoRunner:
             LogEntry(when.strftime("%Y-%m-%d %H:%M:%S"), chain, action, proto, fill(src), fill(dst), port)
         )
 
-    def read_journal(self, chain: Optional[str] = None, actions=None) -> Tuple[str, List[LogEntry]]:
+    def read_journal(self, chain: Optional[str] = None, actions=None, limit: int = 5000) -> Tuple[str, List[LogEntry]]:
         if self._jitter and self._hits:
             for _ in range(random.choice((0, 0, 1, 2))):
                 self._add_hit(datetime.now())
-        return "demo", [e for e in self._hits if chain in (None, e.chain) and (not actions or e.action in actions)]
+        hits = [e for e in self._hits if chain in (None, e.chain) and (not actions or e.action in actions)]
+        return "demo", hits[-limit:]
 
     def logd_state(self) -> Optional[str]:
         return "active"
