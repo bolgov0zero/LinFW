@@ -78,21 +78,30 @@ def hit(day, hms, chain="INPUT", src="1.1.1.1"):
 
 
 def test_writer_uses_one_file_per_day_and_prunes_after_30_days(tmp_path):
+    from datetime import timedelta
+
+    today = date.today()  # the writer also prunes on creation, so the dates must be relative to now
     d = tmp_path / "hits"
     d.mkdir()
-    for old in ("2026-09-01", "2026-09-26", "2026-09-27"):
-        (d / f"hits-{old}.log").write_text(format_hit(hit(old, "10:00:00")) + "\n")
+    days = {n: (today - timedelta(days=n)).isoformat() for n in (45, 31, 30, 1)}
+    for day in days.values():
+        (d / f"hits-{day}.log").write_text(format_hit(hit(day, "10:00:00")) + "\n")
     (d / "hits.log").write_text("legacy\n")
     os.utime(d / "hits.log", (0, 0))  # ancient legacy file
     writer = HitWriter(str(d), keep_days=30)
-    writer.prune(today=date(2026, 10, 27))
-    assert sorted(p.name for p in d.iterdir()) == ["hits-2026-09-27.log"]  # exactly 30 days back survives
-    writer.write(hit("2026-10-27", "12:00:00"))
-    writer.write(hit("2026-10-27", "12:00:01", src="3.3.3.3"))
-    writer.write(hit("2026-10-28", "00:00:05"))
+    # exactly 30 days back survives, older files and the stale legacy file are gone
+    assert sorted(p.name for p in d.iterdir()) == sorted(f"hits-{days[n]}.log" for n in (30, 1))
+    first, second = today.isoformat(), (today + timedelta(days=1)).isoformat()
+    writer.write(hit(first, "12:00:00"))
+    writer.write(hit(first, "12:00:01", src="3.3.3.3"))
+    writer.write(hit(second, "00:00:05"))
     writer.close()
-    assert len((d / "hits-2026-10-27.log").read_text().splitlines()) == 2
-    assert len((d / "hits-2026-10-28.log").read_text().splitlines()) == 1
+    assert len((d / f"hits-{first}.log").read_text().splitlines()) == 2
+    assert len((d / f"hits-{second}.log").read_text().splitlines()) == 1
+    writer = HitWriter(str(d), keep_days=30)
+    writer.prune(today=today + timedelta(days=31))  # cutoff = tomorrow: only tomorrow's file is young enough
+    assert [p.name for p in d.iterdir()] == [f"hits-{second}.log"]
+    writer.close()
 
 
 def test_reader_returns_newest_records_across_days_with_chain_filter(tmp_path):
@@ -151,3 +160,33 @@ def test_legacy_log_twins_are_upgraded_to_nflog_keeping_counters():
     twin = fw.snapshot().rules["INPUT"][-2]
     assert twin.spec[-6:] == tuple(nflog_target("INPUT", "DROP")) and twin.pkts == 9 and twin.is_log
     assert fw.base_ok(fw.snapshot()) and not fw.ensure_base()
+
+
+def test_reader_filters_chain_and_action_independently(tmp_path):
+    from linfw.journal import read_hits
+
+    d = tmp_path / "hits"
+    d.mkdir()
+    rows = [
+        LogEntry("2026-10-28 10:00:01", "INPUT", "accept", "tcp", "1.1.1.1", "2.2.2.2", "22"),
+        LogEntry("2026-10-28 10:00:02", "INPUT", "drop", "tcp", "1.1.1.2", "2.2.2.2", "22"),
+        LogEntry("2026-10-28 10:00:03", "OUTPUT", "drop", "udp", "1.1.1.3", "8.8.8.8", "53"),
+        LogEntry("2026-10-28 10:00:04", "OUTPUT", "reject", "udp", "1.1.1.4", "8.8.8.8", "53"),
+    ]
+    (d / "hits-2026-10-28.log").write_text("\n".join(format_hit(e) for e in rows) + "\n")
+    srcs = lambda **kw: [e.source for e in read_hits(str(d), **kw)]  # noqa: E731
+    assert srcs() == ["1.1.1.1", "1.1.1.2", "1.1.1.3", "1.1.1.4"]
+    assert srcs(actions=frozenset({"drop"})) == ["1.1.1.2", "1.1.1.3"]
+    assert srcs(actions=frozenset({"drop", "reject"}), chain="OUTPUT") == ["1.1.1.3", "1.1.1.4"]
+    assert srcs(actions=frozenset({"accept"}), chain="OUTPUT") == []
+
+
+def test_empty_answer_from_logd_files_does_not_fall_back_to_the_kernel_log(tmp_path, monkeypatch):
+    import linfw.journal as journal
+
+    (tmp_path / "hits-2026-10-28.log").write_text(
+        format_hit(hit("2026-10-28", "10:00:00", chain="INPUT")) + "\n"
+    )
+    monkeypatch.setattr(journal, "HITS_DIR", str(tmp_path))
+    monkeypatch.setattr(journal.persist, "find_binary", lambda name: pytest.fail("journalctl/dmesg must not be run"))
+    assert journal.read_entries("OUTPUT") == ("linfw-logd", [])  # a filter with no matches is just empty

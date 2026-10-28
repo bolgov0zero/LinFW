@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Optional, Set, Tuple
 
 from rich.text import Text
 from textual import on
@@ -224,8 +225,9 @@ def rule_summary(rule: Rule) -> str:
 
 
 FILTERS = (None,) + CHAINS  # None = all chains
+JOURNAL_ACTIONS = ("accept", "drop", "reject")
 COLUMNS = ("time", "chain", "protocol", "source", "destination", "port", "action")
-POLL_SECONDS = 3.0
+POLL_SECONDS = 2.0
 
 
 class JournalTable(DataTable):
@@ -236,25 +238,43 @@ class JournalTable(DataTable):
 
 
 class JournalScreen(Screen):
-    """Rule hits read back from the kernel log, newest first."""
+    """Rule hits recorded by linfw-logd, newest first.
 
-    BINDINGS = [Binding("escape,q,f7", "back", "К правилам")]
+    Two independent filters: the chain (one of Все / INPUT / OUTPUT / FORWARD) and
+    the actions (any combination of accept / drop / reject, none = all). An entry
+    is shown when it passes both."""
+
+    BINDINGS = [
+        Binding("escape,q,f7", "back", "К правилам"),
+        Binding("f5,ctrl+r", "refresh_now", "Обновить"),
+        Binding("a", "toggle_action('accept')", show=False),
+        Binding("d", "toggle_action('drop')", show=False),
+        Binding("r", "toggle_action('reject')", show=False),
+    ]
 
     def __init__(self, firewall) -> None:
         super().__init__()
         self.fw = firewall
         self.filter: Optional[str] = None
+        self.actions: Set[str] = set()
         self._entries: List[LogEntry] = []
         self._source = ""
         self._error = ""
         self._why_empty = ""
+        self._updated = ""
         self._shown: Optional[List[LogEntry]] = None
+        self._seq = 0  # only the newest read may update the table
+        self._busy = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="jbar"):
             for chain in FILTERS:
                 yield ToolButton(chain or "Все", id=f"jf-{chain or 'ALL'}", classes="jfilter")
+            yield Static("│", classes="sep")
+            for action in JOURNAL_ACTIONS:
+                yield ToolButton(action, id=f"ja-{action}", classes="jaction")
             yield Static("", classes="spacer")
+            yield ToolButton("F5 Обновить", id="jrefresh")
             yield ToolButton("Esc ← К правилам", id="jback", variant="primary")
         table = JournalTable(id="jtable", cursor_type="row", zebra_stripes=True)
         table.cursor_foreground_priority = "renderable"
@@ -266,21 +286,41 @@ class JournalScreen(Screen):
         for name in COLUMNS:
             table.add_column(name, key=name)
         table.focus()
-        self._mark_filter()
-        self.set_interval(POLL_SECONDS, self._poll)
+        self._mark_filters()
+        self.set_interval(POLL_SECONDS, self._tick)
         self.run_worker(self._poll())
 
+    async def _tick(self) -> None:
+        """The periodic refresh; skipped while the previous read is still running."""
+        if not self._busy:
+            await self._poll()
+
     async def _poll(self) -> None:
+        self._seq += 1
+        seq = self._seq
+        self._busy = True
         try:
-            self._source, self._entries = await asyncio.to_thread(self.fw.read_journal, self.filter)
-            self._error = ""
-            self._why_empty = "" if self._entries else await self._explain_empty()
+            source, entries = await asyncio.to_thread(
+                self.fw.read_journal, self.filter, frozenset(self.actions) or None
+            )
+            why = "" if entries else await self._explain_empty()
+            if seq != self._seq:  # a newer read (another filter, F5) has been started: drop this one
+                return
+            self._source, self._entries, self._error, self._why_empty = source, entries, "", why
+            self._updated = datetime.now().strftime("%H:%M:%S")
         except FirewallError as exc:
+            if seq != self._seq:
+                return
             self._error = str(exc)
+        finally:
+            if seq == self._seq:
+                self._busy = False
         self._redraw()
 
     async def _explain_empty(self) -> str:
         """Tell the user why there is nothing to show instead of leaving a blank table."""
+        if self.filter or self.actions:
+            return "Записей нет: под выбранные фильтры (цепочка, действие) ничего не подходит."
         try:
             rules, hits, state = await asyncio.to_thread(self.fw.log_diagnosis)
         except FirewallError:
@@ -303,13 +343,15 @@ class JournalScreen(Screen):
             "возможно, не загружен модуль nfnetlink_log (в контейнере его загружают на хосте: modprobe nfnetlink_log)."
         )
 
-    def _mark_filter(self) -> None:
+    def _mark_filters(self) -> None:
         for chain in FILTERS:
             self.query_one(f"#jf-{chain or 'ALL'}", ToolButton).set_class(chain == self.filter, "active")
+        for action in JOURNAL_ACTIONS:
+            self.query_one(f"#ja-{action}", ToolButton).set_class(action in self.actions, "active")
 
     def _redraw(self) -> None:
         table = self.query_one("#jtable", JournalTable)
-        shown = list(reversed(self._entries))  # the reader already applied the chain filter
+        shown = list(reversed(self._entries))  # the reader already applied both filters
         if shown != self._shown:
             row, scroll = table.cursor_row, table.scroll_y
             table.clear()
@@ -330,33 +372,50 @@ class JournalScreen(Screen):
             table.scroll_y = scroll
             self._shown = shown
         status = self.query_one("#jstatus", Static)
+        stamp = f"обновлено {self._updated}" if self._updated else ""
         if self._error:
             status.update(Text(self._error, style="bold #ff5555"))
         elif not self._entries:
-            status.update(self._why_empty or "Записей нет.")
+            status.update(f"{self._why_empty or 'Записей нет.'}  ·  {stamp}")
         else:
             count = f"последние {MAX_ENTRIES}" if len(shown) >= MAX_ENTRIES else str(len(shown))
             status.update(
-                f"Источник: {self._source}  ·  записей: {count}  ·  хранится {RETENTION_DAYS} дн."
-                "  ·  ←→ цепочка  ·  Esc назад"
+                f"{self._source}  ·  записей: {count} (за {RETENTION_DAYS} дн.)  ·  {stamp}"
+                "  ·  ←→ цепочка  ·  a d r действие  ·  F5 обновить"
             )
+
+    def _reload(self) -> None:
+        """Filters changed or the user asked: redraw from scratch and read right now."""
+        self._shown = None
+        self._mark_filters()
+        self.run_worker(self._poll(), exclusive=True)
 
     def _set_filter(self, chain: Optional[str]) -> None:
         self.filter = chain
-        self._shown = None
-        self._mark_filter()
-        self.run_worker(self._poll(), exclusive=True)
+        self._reload()
 
     @on(Button.Pressed, ".jfilter")
     def _filter_pressed(self, event: Button.Pressed) -> None:
         name = (event.button.id or "jf-ALL")[3:]
         self._set_filter(None if name == "ALL" else name)
 
+    @on(Button.Pressed, ".jaction")
+    def _action_pressed(self, event: Button.Pressed) -> None:
+        self.action_toggle_action((event.button.id or "")[3:])
+
+    def action_toggle_action(self, action: str) -> None:
+        self.actions.symmetric_difference_update({action})
+        self._reload()
+
     def action_next_filter(self) -> None:
         self._set_filter(FILTERS[(FILTERS.index(self.filter) + 1) % len(FILTERS)])
 
     def action_prev_filter(self) -> None:
         self._set_filter(FILTERS[(FILTERS.index(self.filter) - 1) % len(FILTERS)])
+
+    @on(Button.Pressed, "#jrefresh")
+    def action_refresh_now(self) -> None:
+        self._reload()
 
     @on(Button.Pressed, "#jback")
     def action_back(self) -> None:

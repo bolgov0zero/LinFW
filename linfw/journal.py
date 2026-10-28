@@ -15,7 +15,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from datetime import date
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, FrozenSet, List, Optional, Tuple
 
 from . import persist
 from .model import LOG_PREFIX, FirewallError
@@ -77,7 +77,17 @@ def list_hit_files(directory: str) -> List[str]:
     return [os.path.join(directory, n) for n in legacy + dated]
 
 
-def read_hits(directory: str = HITS_DIR, chain: Optional[str] = None, limit: int = MAX_ENTRIES) -> Optional[List[LogEntry]]:
+def _wanted(entry: LogEntry, chain: Optional[str], actions: Optional[FrozenSet[str]]) -> bool:
+    """The chain and action filters are independent: an entry must pass both."""
+    return chain in (None, entry.chain) and (not actions or entry.action in actions)
+
+
+def read_hits(
+    directory: str = HITS_DIR,
+    chain: Optional[str] = None,
+    limit: int = MAX_ENTRIES,
+    actions: Optional[FrozenSet[str]] = None,
+) -> Optional[List[LogEntry]]:
     """The newest `limit` records (oldest first), or None if there is no record directory.
     Files are read newest to oldest and only as far as needed, from their ends."""
     files = list_hit_files(directory)
@@ -88,7 +98,7 @@ def read_hits(directory: str = HITS_DIR, chain: Optional[str] = None, limit: int
         text = _tail(path, whole_lines=True)
         if text is None:
             continue
-        entries = [e for e in parse_hits(text) if chain in (None, e.chain)]
+        entries = [e for e in parse_hits(text) if _wanted(e, chain, actions)]
         collected = entries + collected
         if len(collected) >= limit:
             break
@@ -157,40 +167,45 @@ def _tail(path: str, nbytes: int = 2_000_000, whole_lines: bool = False) -> Opti
     return data
 
 
-def _from_kernel_log(read: Callable[[], Optional[str]], chain: Optional[str]) -> Callable[[], Optional[List[LogEntry]]]:
+def _from_kernel_log(
+    read: Callable[[], Optional[str]], chain: Optional[str], actions: Optional[FrozenSet[str]]
+) -> Callable[[], Optional[List[LogEntry]]]:
     def reader() -> Optional[List[LogEntry]]:
         text = read()
         if text is None:
             return None
-        return [e for e in parse_text(text) if chain in (None, e.chain)]
+        return [e for e in parse_text(text) if _wanted(e, chain, actions)]
 
     return reader
 
 
-def _sources(chain: Optional[str]):
+def _sources(chain: Optional[str], actions: Optional[FrozenSet[str]]):
     """Candidate (name, reader) pairs, most likely first. A reader returns entries or None."""
-    yield "linfw-logd", lambda: read_hits(HITS_DIR, chain)
+    yield "linfw-logd", lambda: read_hits(HITS_DIR, chain, actions=actions)
     journalctl = persist.find_binary("journalctl")
     if journalctl:
         yield "journalctl -k", _from_kernel_log(
-            lambda: _run([journalctl, "-k", "-o", "short-iso", "--no-pager", "-q", "-n", "20000"]), chain
+            lambda: _run([journalctl, "-k", "-o", "short-iso", "--no-pager", "-q", "-n", "20000"]), chain, actions
         )
     for path in _LOG_FILES:
-        yield path, _from_kernel_log(lambda p=path: _tail(p, 4_000_000), chain)
+        yield path, _from_kernel_log(lambda p=path: _tail(p, 4_000_000), chain, actions)
     dmesg = persist.find_binary("dmesg")
     if dmesg:
-        yield "dmesg", _from_kernel_log(lambda: _run([dmesg, "-T"]), chain)
+        yield "dmesg", _from_kernel_log(lambda: _run([dmesg, "-T"]), chain, actions)
 
 
-def read_entries(chain: Optional[str] = None) -> Tuple[str, List[LogEntry]]:
-    """Return (source name, entries oldest-first), optionally only one chain.
+def read_entries(chain: Optional[str] = None, actions: Optional[FrozenSet[str]] = None) -> Tuple[str, List[LogEntry]]:
+    """Return (source name, entries oldest-first), optionally only one chain and/or
+    only some actions ("accept", "drop", "reject"; the two filters are independent).
     Sources are tried in turn and the first one that has records wins."""
     first_readable = ""
-    for name, read in _sources(chain):
+    for name, read in _sources(chain, actions):
         entries = read()
         if entries is None:
             continue
-        if entries:
+        if entries or (name == "linfw-logd" and list_hit_files(HITS_DIR)):
+            # once the service has written files, an empty answer means "nothing matches
+            # the filters", not "look elsewhere": the kernel log is only for old LOG rules
             return name, entries
         first_readable = first_readable or name
     if first_readable:

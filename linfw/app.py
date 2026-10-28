@@ -104,8 +104,12 @@ class LinFWApp(App):
     .row Checkbox:focus { background: $primary 40%; }
     #error { color: $error; height: auto; margin: 1 0 0 0; }
     #jbar { height: 1; padding: 0 1; background: $panel; }
-    #jbar Button { min-width: 0; height: 1; border: none; padding: 0 2; margin-right: 1; }
+    #jbar Button { min-width: 0; height: 1; border: none; padding: 0; margin-right: 1; }
     #jbar .spacer { width: 1fr; }
+    #jbar .sep { width: 1; color: $text-muted; margin-right: 1; }
+    #jbar #ja-accept.active { background: #3fb950; color: #0b1f10; text-style: bold; }
+    #jbar #ja-drop.active { background: #f85149; color: #2b0a08; text-style: bold; }
+    #jbar #ja-reject.active { background: #f0883e; color: #2b1405; text-style: bold; }
     #jbar Button.active { background: $accent; color: $text; text-style: bold; }
     #jtable { height: 1fr; }
     #jstatus { height: auto; min-height: 1; padding: 0 1; background: $panel-darken-1; }
@@ -126,6 +130,7 @@ class LinFWApp(App):
         Binding("f7,j", "journal", "Журнал"),
         Binding("r", "refresh_now", "Обновить"),
         Binding("f10,q,ctrl+q", "quit", "Выход"),
+        Binding("escape", "leave", "Выход"),
     ]
 
     def __init__(self, firewall: Firewall) -> None:
@@ -435,6 +440,11 @@ class LinFWApp(App):
 
     @on(Button.Pressed, "#btn-quit")
     def _btn_quit(self) -> None:
+        self.exit()
+
+    def action_leave(self) -> None:
+        """Esc on the main screen quits. Dialogs and the journal bind Esc themselves
+        (it closes them), and check_action keeps this one inert while they are open."""
         self.exit()
 
     @on(Button.Pressed, "#btn-journal")

@@ -278,7 +278,7 @@ async def test_journal_error_and_empty_states():
         status = str(app.screen.query_one("#jstatus").render())
         assert "Записей нет" in status
 
-        def broken(chain=None):
+        def broken(chain=None, actions=None):
             from linfw.model import FirewallError
             raise FirewallError("Журнал ядра недоступен: тест")
         runner.read_journal = broken
@@ -400,3 +400,107 @@ async def test_template_dialog_button_and_click():
         await pilot.click("#cancel")
         await pilot.pause(0.4)
         assert not isinstance(app.screen, TemplateScreen)
+
+
+async def test_open_journal_picks_up_new_records_by_itself():
+    from linfw.journal import LogEntry
+
+    runner = DemoRunner(sample=False, jitter=False)
+    fw = Firewall(runner)
+    app = LinFWApp(fw)
+    async with app.run_test(size=(140, 36)) as pilot:
+        await pilot.pause()
+        await pilot.press("f7")
+        await pilot.pause(0.5)
+        table = app.screen.query_one("#jtable", DataTable)
+        assert table.row_count == 0
+        status = lambda: str(app.screen.query_one("#jstatus").render())  # noqa: E731
+        assert "обновлено " in status()
+
+        runner._hits.append(LogEntry("2026-10-28 12:00:00", "INPUT", "drop", "tcp", "1.1.1.1", "2.2.2.2", "22"))
+        await pilot.pause(2.6)  # no key, no click: the periodic read must find it
+        assert table.row_count == 1
+        runner._hits.append(LogEntry("2026-10-28 12:00:05", "OUTPUT", "accept", "udp", "3.3.3.3", "8.8.8.8", "53"))
+        await pilot.pause(2.6)
+        assert table.row_count == 2 and str(table.get_row_at(0)[3]) == "3.3.3.3"  # newest on top
+
+        runner._hits.append(LogEntry("2026-10-28 12:00:09", "INPUT", "reject", "tcp", "4.4.4.4", "5.5.5.5", "80"))
+        await pilot.press("f5")  # manual refresh is immediate
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert table.row_count == 3
+
+
+async def test_journal_action_filters_are_independent_of_the_chain():
+    from linfw.journal import LogEntry
+
+    runner = DemoRunner(sample=False, jitter=False)
+    hit = lambda chain, action, n: LogEntry(f"2026-10-28 10:00:{n:02d}", chain, action, "tcp", f"9.9.9.{n}", "2.2.2.2", "22")  # noqa: E731
+    runner._hits = [
+        hit("INPUT", "accept", 1), hit("INPUT", "drop", 2), hit("INPUT", "reject", 3),
+        hit("OUTPUT", "accept", 4), hit("OUTPUT", "drop", 5), hit("FORWARD", "drop", 6),
+    ]
+    app = LinFWApp(Firewall(runner))
+    async with app.run_test(size=(140, 36)) as pilot:
+        await pilot.pause()
+        await pilot.press("f7")
+        await pilot.pause(0.5)
+        screen = app.screen
+        table = screen.query_one("#jtable", DataTable)
+
+        async def settle():
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+        def rows():
+            return {(str(table.get_row_at(i)[1]), str(table.get_row_at(i)[6])) for i in range(table.row_count)}
+
+        assert table.row_count == 6
+        await pilot.click("#ja-drop")  # actions alone: every chain
+        await settle()
+        assert rows() == {("input", "drop"), ("output", "drop"), ("forward", "drop")}
+
+        await pilot.click("#jf-OUTPUT")  # chain + action: both apply
+        await settle()
+        assert rows() == {("output", "drop")}
+
+        await pilot.click("#ja-accept")  # several actions at once
+        await settle()
+        assert rows() == {("output", "drop"), ("output", "accept")}
+
+        await pilot.click("#jf-ALL")  # the chain filter off, the action filters stay
+        await settle()
+        assert {a for _, a in rows()} == {"drop", "accept"} and table.row_count == 5
+
+        await pilot.click("#ja-drop")  # toggling off
+        await pilot.click("#ja-accept")
+        await settle()
+        assert table.row_count == 6
+
+        await pilot.press("r")  # keyboard: reject
+        await settle()
+        assert rows() == {("input", "reject")} and screen.query_one("#ja-reject").has_class("active")
+        await pilot.press("r")
+        await settle()
+        assert table.row_count == 6
+        await pilot.press("d", "right")  # drop + INPUT
+        await settle()
+        assert rows() == {("input", "drop")}
+
+
+async def test_escape_quits_only_from_the_main_screen():
+    app, _ = make_app()
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        for key, screen in (("f1", AddRuleScreen), ("f3", TemplateScreen), ("f2", ConfirmScreen), ("f7", JournalScreen)):
+            await pilot.press(key)
+            await pilot.pause(0.4)
+            assert isinstance(app.screen, screen)
+            await pilot.press("escape")  # closes the dialog / journal, the app stays
+            await pilot.pause(0.4)
+            assert app.is_running and not isinstance(app.screen, screen)
+        await pilot.press("escape")  # on the rules table it quits
+        await pilot.pause(0.5)
+        assert not app.is_running
