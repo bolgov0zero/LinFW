@@ -525,3 +525,39 @@ async def test_escape_quits_only_from_the_main_screen():
         await pilot.press("escape")  # on the rules table it quits
         await pilot.pause(0.5)
         assert not app.is_running
+
+
+async def test_interface_polish_theme_tabs_empty_state_and_toolbar():
+    from textual.widgets import Button, Static, Tab
+
+    runner = DemoRunner(jitter=False)
+    runner.rules["OUTPUT"].clear()
+    app = LinFWApp(Firewall(runner))
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause(0.4)
+        assert app.theme == "linfw"
+        tab = lambda chain: str(app.query_one(f"#tab-{chain}", Tab).label)  # noqa: E731
+        assert tab("INPUT").split() == ["INPUT", "6", "accept"] and tab("FORWARD").split() == ["FORWARD", "2", "drop"]
+        btn = lambda i: app.query_one(f"#btn-{i}", Button)  # noqa: E731
+
+        assert btn("up").disabled and not btn("down").disabled and not btn("delete").disabled  # first row selected
+        assert str(btn("toggle").label) == "F6 Выключить"
+        await pilot.press("f6")
+        await pilot.pause(0.5)
+        assert str(btn("toggle").label) == "F6 Включить"  # it says what it will do next
+        await pilot.press("down", "down", "down", "down", "down")  # to the last of six rows
+        await pilot.pause()
+        assert btn("down").disabled and not btn("up").disabled  # last row
+
+        detail = str(app.query_one("#detail", Static).render())
+        assert "порт" in detail or "Отклоняет" in detail or "Разрешает" in detail or "Отбрасывает" in detail
+        assert "-A INPUT" in detail  # the readable sentence is followed by the raw rule
+
+        await pilot.press("right")  # OUTPUT has no rules: a hint instead of an empty table
+        await pilot.pause(0.4)
+        assert app.query_one("#empty").display and not app.query_one("#rules").display
+        assert "нет своих правил" in str(app.query_one("#empty", Static).render())
+        assert btn("delete").disabled and btn("up").disabled
+        await pilot.press("right")  # chain switching still works without a table to focus
+        await pilot.pause(0.4)
+        assert app.query_one("#rules").display and not app.query_one("#empty").display

@@ -14,16 +14,16 @@ from .firewall import Firewall
 from .model import CHAINS, FirewallError, NewRule, Rule
 from .parser import Snapshot
 from .screens import (
-    ACTION_STYLE,
     AddRuleScreen,
     ConfirmScreen,
     JournalScreen,
     TemplateScreen,
     ToolButton,
+    describe_rule,
+    key_label,
     rule_summary,
 )
-
-POLICY_STYLE = {"ACCEPT": "#2ecc71", "DROP": "#ff5555", "REJECT": "#ff9f1a"}
+from .theme import ACTION_STYLE, LINFW_THEME, POLICY_STYLE
 COLUMNS = ("#", "Pkts", "chain", "protocol", "source", "destination", "port", "action")
 REFRESH_SECONDS = 2.0
 
@@ -42,14 +42,15 @@ def humanize(n: int) -> str:
 def row_cells(rule: Rule, pkts: Optional[int] = None) -> List[Text]:
     dim = "" if rule.enabled else "dim"
     action = rule.action + (" ●" if rule.log else "") + ("" if rule.enabled else " (off)")
+    quiet = "dim"  # "any", "-" and "all" are the absence of a condition: keep them in the background
     cells = [
-        Text(str(rule.number), style=dim, justify="right"),
+        Text(str(rule.number), style="dim", justify="right"),
         Text(humanize(rule.pkts if pkts is None else pkts), style=dim, justify="right"),
-        Text(rule.chain.lower(), style=dim),
-        Text(rule.protocol, style=dim),
-        Text(rule.source or "any", style=dim),
-        Text(rule.destination or "any", style=dim),
-        Text((rule.port or "-") + (" +" if rule.extra else ""), style=dim),
+        Text(rule.chain.lower(), style="dim"),
+        Text(rule.protocol, style=dim or (quiet if rule.protocol == "all" else "")),
+        Text(rule.source or "any", style=dim or ("" if rule.source else quiet)),
+        Text(rule.destination or "any", style=dim or ("" if rule.destination else quiet)),
+        Text((rule.port or "-") + (" +" if rule.extra else ""), style=dim or ("bold" if rule.port else quiet)),
         Text(action, style="dim" if not rule.enabled else ACTION_STYLE.get(rule.action, "bold")),
     ]
     return cells
@@ -75,16 +76,26 @@ class RulesTable(DataTable):
 class LinFWApp(App):
     TITLE = "LinFW"
     CSS = """
-    Screen { background: $surface; }
+    Screen { background: $background; }
     #toolbar { height: 1; padding: 0 1; background: $panel; }
-    #toolbar Button { min-width: 0; height: 1; border: none; padding: 0; margin-right: 1; }
-    #chains { height: 2; }
-    #rules { height: 1fr; }
-    DataTable { background: $surface; }
+    #toolbar Button, #jbar Button {
+        min-width: 0; height: 1; border: none; padding: 0 1; margin: 0;
+        background: transparent; color: $text;
+    }
+    #toolbar Button:hover, #jbar Button:hover { background: $primary 35%; }
+    #toolbar Button:disabled { opacity: 0.35; }
+    #toolbar #btn-delete:hover { background: $error 45%; }
+    #toolbar .sep, #jbar .sep { width: 1; color: $text-muted; margin: 0 1; }
+    #chains { height: 2; background: $background; }
+    #chains Tab { padding: 0 2; }
+    #rules { height: 1fr; background: $background; }
+    #empty { height: 1fr; content-align: center middle; text-align: center; color: $text-muted; }
+    DataTable > .datatable--header { background: $panel; color: $text-muted; text-style: bold; }
+    DataTable > .datatable--odd-row { background: $surface; }
     DataTable > .datatable--cursor { background: $primary 35%; }
     DataTable:focus > .datatable--cursor { background: $primary 45%; }
-    #detail { height: 1; padding: 0 1; color: $text-muted; background: $panel; }
-    #status { height: 1; padding: 0 1; background: $panel-darken-1; }
+    #detail { height: 2; padding: 0 1; background: $panel; }
+    #status { height: 1; padding: 0 1; color: $text-muted; background: $surface; }
 
     ModalScreen { align: center middle; }
     .dialog {
@@ -104,13 +115,11 @@ class LinFWApp(App):
     .row Checkbox:focus { background: $primary 40%; }
     #error { color: $error; height: auto; margin: 1 0 0 0; }
     #jbar { height: 1; padding: 0 1; background: $panel; }
-    #jbar Button { min-width: 0; height: 1; border: none; padding: 0; margin-right: 1; }
     #jbar .spacer { width: 1fr; }
-    #jbar .sep { width: 1; color: $text-muted; margin-right: 1; }
-    #jbar #ja-accept.active { background: #3fb950; color: #0b1f10; text-style: bold; }
-    #jbar #ja-drop.active { background: #f85149; color: #2b0a08; text-style: bold; }
-    #jbar #ja-reject.active { background: #f0883e; color: #2b1405; text-style: bold; }
-    #jbar Button.active { background: $accent; color: $text; text-style: bold; }
+    #jbar Button.active { background: $accent; color: $background; text-style: bold; }
+    #jbar #ja-accept.active { background: $success; }
+    #jbar #ja-drop.active { background: $error; }
+    #jbar #ja-reject.active { background: $warning; }
     #jtable { height: 1fr; }
     #jstatus { height: auto; min-height: 1; padding: 0 1; background: $panel-darken-1; }
     .buttons { height: 1; align-horizontal: right; margin-top: 1; }
@@ -131,6 +140,8 @@ class LinFWApp(App):
         Binding("r", "refresh_now", "Обновить"),
         Binding("f10,q,ctrl+q", "quit", "Выход"),
         Binding("escape", "leave", "Выход"),
+        Binding("left", "prev_chain", show=False),
+        Binding("right", "next_chain", show=False),
     ]
 
     def __init__(self, firewall: Firewall) -> None:
@@ -150,23 +161,30 @@ class LinFWApp(App):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="toolbar"):
-            yield ToolButton("F1 Добавить", id="btn-add", variant="success")
-            yield ToolButton("F2 Удалить", id="btn-delete", variant="error")
-            yield ToolButton("F3 Шаблон", id="btn-template", variant="primary")
-            yield ToolButton("F4 ▲ Вверх", id="btn-up")
-            yield ToolButton("F5 ▼ Вниз", id="btn-down")
-            yield ToolButton("F6 Выкл/Вкл", id="btn-toggle", variant="warning")
-            yield ToolButton("F7 Журнал", id="btn-journal", variant="primary")
-            yield ToolButton("F10 Выход", id="btn-quit")
+            yield ToolButton(key_label("F1", "Добавить"), id="btn-add")
+            yield ToolButton(key_label("F2", "Удалить"), id="btn-delete")
+            yield ToolButton(key_label("F3", "Шаблон"), id="btn-template")
+            yield Static("│", classes="sep")
+            yield ToolButton(key_label("F4", "▲ Вверх"), id="btn-up")
+            yield ToolButton(key_label("F5", "▼ Вниз"), id="btn-down")
+            yield ToolButton(key_label("F6", "Выключить"), id="btn-toggle")
+            yield Static("│", classes="sep")
+            yield ToolButton(key_label("F7", "Журнал"), id="btn-journal")
+            yield ToolButton(key_label("F10", "Выход"), id="btn-quit")
         yield ChainTabs(*[Tab(name, id=f"tab-{name}") for name in CHAINS], id="chains")
         # "renderable": the green/red/orange action text stays coloured under the cursor
         table = RulesTable(id="rules", cursor_type="row", zebra_stripes=True)
         table.cursor_foreground_priority = "renderable"
         yield table
+        empty = Static("", id="empty")
+        empty.display = False
+        yield empty
         yield Static("", id="detail")
         yield Static("", id="status")
 
     def on_mount(self) -> None:
+        self.register_theme(LINFW_THEME)
+        self.theme = LINFW_THEME.name
         table = self.table
         for name in COLUMNS:
             table.add_column(name, key=name)
@@ -263,6 +281,8 @@ class LinFWApp(App):
                 table.move_cursor(row=new_keys.index(target), animate=False)
             table.scroll_y = scroll
         self._shown = rules
+        self._show_empty(not rules)
+        self._update_tabs()
         self._update_detail()
         self._update_status()
 
@@ -276,20 +296,63 @@ class LinFWApp(App):
         rule = self._selected_rule()
         return rule.key if rule else None
 
+    def _show_empty(self, empty: bool) -> None:
+        """A chain without rules shows a hint instead of a bare table header."""
+        main = self._main()
+        table, hint = self.table, main.query_one("#empty", Static)
+        if hint.display == empty:
+            return
+        table.display = not empty
+        hint.display = empty
+        if empty:
+            policy = self.snapshot.policies.get(self.current, "?")
+            colour = POLICY_STYLE.get(policy, "")
+            hint.update(
+                Text.assemble(
+                    (f"В цепочке {self.current} нет своих правил\n", "bold"),
+                    ("Политика по умолчанию: ", ""),
+                    (policy, f"bold {colour}"),
+                    "\n\n",
+                    ("F1", "bold"), " добавить правило   ·   ", ("F3", "bold"), " выбрать шаблон",
+                )
+            )
+        else:
+            table.focus()
+
+    def _update_tabs(self) -> None:
+        """INPUT  6  ACCEPT: how many rules a chain has and what its default policy is."""
+        for chain in CHAINS:
+            tab = self._main().query_one(f"#tab-{chain}", Tab)
+            count = sum(1 for r in self.snapshot.rules.get(chain, []) if not r.hidden)
+            policy = self.snapshot.policies.get(chain, "?")
+            tab.label = Text.assemble(
+                chain, "  ", (str(count), "bold"), "  ", (policy.lower(), POLICY_STYLE.get(policy, "dim"))
+            )
+
+    def _sync_toolbar(self, rule: Optional[Rule]) -> None:
+        """Buttons that cannot do anything right now are dimmed; the toggle says what it will do."""
+        main, row, total = self._main(), self.table.cursor_row, len(self._shown or [])
+        main.query_one("#btn-delete", Button).disabled = rule is None
+        main.query_one("#btn-toggle", Button).disabled = rule is None
+        main.query_one("#btn-up", Button).disabled = rule is None or row <= 0
+        main.query_one("#btn-down", Button).disabled = rule is None or row >= total - 1
+        verb = "Включить" if rule is not None and not rule.enabled else "Выключить"
+        main.query_one("#btn-toggle", Button).label = key_label("F6", verb)
+
     def _update_detail(self) -> None:
         rule = self._selected_rule()
-        self._main().query_one("#detail", Static).update(
-            Text(rule.describe() if rule else "Правил нет — нажмите F1 или F3", overflow="ellipsis", no_wrap=True)
-        )
+        self._sync_toolbar(rule)
+        detail = Text(no_wrap=True, overflow="ellipsis")
+        if rule:
+            pkts, nbytes = self._totals.get(rule.key, (rule.pkts, rule.bytes))
+            detail = describe_rule(rule, pkts, nbytes)
+            detail.no_wrap, detail.overflow = True, "ellipsis"
+            detail.append("\n" + rule.describe(), style="dim")
+        self._main().query_one("#detail", Static).update(detail)
 
     def _update_status(self) -> None:
-        policies = "  ".join(
-            f"{c}: [{POLICY_STYLE.get(self.snapshot.policies.get(c, ''), 'dim')}]"
-            f"{self.snapshot.policies.get(c, '?')}[/]"
-            for c in CHAINS
-        )
         self._main().query_one("#status", Static).update(
-            f"{policies}   ·   {self._persist_note}   ·   базовые: lo, established   ·   q выход"
+            f"{self._persist_note}   ·   базовые правила: lo, established   ·   ←→ цепочка   ·   Esc выход"
         )
 
     @on(DataTable.RowHighlighted)

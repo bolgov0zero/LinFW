@@ -14,10 +14,55 @@ from textual.widgets import Button, Checkbox, DataTable, Input, Label, OptionLis
 from textual.widgets.option_list import Option
 
 from .journal import MAX_ENTRIES, RETENTION_DAYS, LogEntry
+from .theme import ACTION_STYLE, BLUE, GREEN, MUTED, ORANGE, RED
 from .model import ACTIONS, CHAINS, PROTOCOLS, FirewallError, NewRule, Rule
 from .widgets import Segmented
 
-ACTION_STYLE = {"accept": "bold #2ecc71", "drop": "bold #ff5555", "reject": "bold #ff9f1a"}
+
+def key_label(key: str, name: str) -> Text:
+    """`F1 Добавить` with the key picked out in the accent colour."""
+    return Text.assemble((key, f"bold {BLUE}"), " " + name)
+
+
+def human_bytes(n: int) -> str:
+    value = float(n)
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if value < 1024 or unit == "ТБ":
+            return f"{int(value)} {unit}" if unit == "Б" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{n} Б"
+
+
+_VERB = {"accept": ("Разрешает", GREEN), "drop": ("Отбрасывает", RED), "reject": ("Отклоняет", ORANGE)}
+_PROTOCOL = {"all": "весь трафик", "tcp": "TCP", "udp": "UDP", "icmp": "ICMP (ping)"}
+
+
+def describe_rule(rule: "Rule", pkts: int, nbytes: int) -> Text:
+    """One readable sentence about a rule: what it does, to whom, and how busy it is."""
+    verb, colour = _VERB.get(rule.action, (rule.action, MUTED))
+    what = _PROTOCOL.get(rule.protocol, rule.protocol)
+    where = ""
+    if rule.source:
+        where += f" от {rule.source}"
+    if rule.destination:
+        where += f" к {rule.destination}"
+    if rule.port:
+        where += f", порт {rule.port}"
+    out = Text()
+    if not rule.enabled:
+        out.append("выключено · ", style="dim")
+    out.append(verb, style=f"bold {colour}")
+    out.append(f" {what}{where}")
+    if rule.extra:
+        out.append(" (+ доп. условия)", style="dim")
+    out.append(f"   ·   {humanize_count(pkts)} пакетов, {human_bytes(nbytes)}", style="dim")
+    if rule.log:
+        out.append("   ·   журнал ●", style="dim")
+    return out
+
+
+def humanize_count(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
 
 
 class ToolButton(Button, can_focus=False):
@@ -277,8 +322,8 @@ class JournalScreen(Screen):
             for action in JOURNAL_ACTIONS:
                 yield ToolButton(action, id=f"ja-{action}", classes="jaction")
             yield Static("", classes="spacer")
-            yield ToolButton("F5 Обновить", id="jrefresh")
-            yield ToolButton("Esc ← К правилам", id="jback", variant="primary")
+            yield ToolButton(key_label("F5", "Обновить"), id="jrefresh")
+            yield ToolButton(key_label("Esc", "← К правилам"), id="jback")
         table = JournalTable(id="jtable", cursor_type="row", zebra_stripes=True)
         table.cursor_foreground_priority = "renderable"
         yield table
