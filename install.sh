@@ -60,6 +60,7 @@ cleanup() {
 # Called by the steps (they run in a subshell, so they talk to the screen through files):
 note() { printf '%s\n' "$*" >> "$NOTE_FILE"; }        # grey detail after the step's name
 warn_note() { printf '%s\n' "$*" >> "$WARN_FILE"; }   # yellow line under the step
+abort() { printf '%s\n' "$@" > "$FATAL_FILE"; exit 1; }  # stop the installation with an explanation
 
 # run_step "Title" function: spinner while it runs, then a check mark (or a cross and the log).
 run_step() {
@@ -68,6 +69,7 @@ run_step() {
   label="[$STEP/$TOTAL] $title"
   : > "$NOTE_FILE"
   : > "$WARN_FILE"
+  : > "$FATAL_FILE"
   if [ "$TTY" = 1 ]; then
     ( set -e; "$fn" ) < /dev/null >> "$LOG" 2>&1 &
     local pid=$!
@@ -86,10 +88,16 @@ run_step() {
   fi
   if [ "$rc" -ne 0 ]; then
     printf '  %s%s%s %s\n\n' "$C_ERR" "$M_ERR" "$C_OFF" "$label"
-    printf '  %sПоследние строки журнала:%s\n' "$C_DIM" "$C_OFF"
-    tail -n 12 "$LOG" | sed 's/^/    /'
-    printf '\n  Полный журнал: %s\n\n' "$LOG"
-    KEEP_LOG=1
+    if [ -s "$FATAL_FILE" ]; then
+      # a deliberate refusal (unsupported system): say why, no log needed
+      sed 's/^/    /' "$FATAL_FILE"
+      printf '\n'
+    else
+      printf '  %sПоследние строки журнала:%s\n' "$C_DIM" "$C_OFF"
+      tail -n 12 "$LOG" | sed 's/^/    /'
+      printf '\n  Полный журнал: %s\n\n' "$LOG"
+      KEEP_LOG=1
+    fi
     exit 1
   fi
   detail=""
@@ -107,58 +115,56 @@ fail_early() {
 
 # --- steps --------------------------------------------------------------------
 
-step_system() {
-  local name="Linux"
-  if [ -r /etc/os-release ]; then
-    name="$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-Linux}")"
+# 0 if the os-release file describes Debian, Ubuntu or a derivative (Mint, Raspberry Pi OS ...);
+# prints the pretty name either way
+supported_os() {
+  local file="${1:-${OS_RELEASE:-/etc/os-release}}" id="" like="" name="Linux"
+  if [ -r "$file" ]; then
+    id="$(. "$file"; printf '%s' "${ID:-}")"
+    like="$(. "$file"; printf '%s' "${ID_LIKE:-}")"
+    name="$(. "$file"; printf '%s' "${PRETTY_NAME:-Linux}")"
   fi
+  printf '%s' "$name"
+  case " $id $like " in
+    *" debian "* | *" ubuntu "*) return 0 ;;
+  esac
+  return 1
+}
+
+step_system() {
+  local name
+  if ! name="$(supported_os)"; then
+    abort "LinFW поддерживает только Debian и Ubuntu (и их производные)." \
+          "Ваша система: $name." \
+          "Нужны пакеты iptables-persistent и ipset-persistent: на других дистрибутивах" \
+          "правила и адресные списки не переживут перезагрузку."
+  fi
+  command -v apt-get > /dev/null || abort "Не найден apt-get: установка возможна только на системах с apt."
   note "$name"
 }
 
-# python3 + venv, iptables, and whatever restores the rules at boot
+# python3 + venv, iptables, and what restores rules and address lists at boot
 step_packages() {
-  local persist=""
-  if command -v apt-get > /dev/null; then
-    export DEBIAN_FRONTEND=noninteractive
-    # answer iptables-persistent's "save current rules?" questions
-    if command -v debconf-set-selections > /dev/null; then
-      echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
-      echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
-    fi
-    apt-get update -qq
-    apt-get install -y -qq python3 python3-venv iptables iptables-persistent netfilter-persistent
-    persist="netfilter-persistent"
-  elif command -v dnf > /dev/null || command -v yum > /dev/null; then
-    local pm
-    pm="$(command -v dnf || command -v yum)"
-    "$pm" install -y -q python3 iptables iptables-services
-    # keep the rules that are active right now, then enable restore at boot
-    # (do not start the service: that would replace the live rules with the file)
-    iptables-save > /etc/sysconfig/iptables
-    chmod 600 /etc/sysconfig/iptables
-    systemctl enable iptables || warn_note "не удалось включить сервис iptables"
-    if systemctl is-active --quiet firewalld 2> /dev/null; then
-      warn_note "firewalld управляет правилами сам: systemctl disable --now firewalld"
-    fi
-    persist="/etc/sysconfig/iptables"
-  elif command -v pacman > /dev/null; then
-    pacman -S --noconfirm --needed python iptables
-    mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/iptables.rules
-    systemctl enable iptables || warn_note "не удалось включить сервис iptables"
-    persist="/etc/iptables/iptables.rules"
-  elif command -v apk > /dev/null; then
-    apk add --no-cache python3 py3-pip iptables
-    rc-update add iptables || true
-    /etc/init.d/iptables save || true
-    persist="/etc/init.d/iptables"
-  else
-    warn_note "неизвестный дистрибутив: поставьте вручную python3 (3.9+, с venv), iptables и сохранение правил"
+  export DEBIAN_FRONTEND=noninteractive
+  # answer iptables-persistent's "save current rules?" questions
+  if command -v debconf-set-selections > /dev/null; then
+    echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+    echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
   fi
-  command -v python3 > /dev/null || { echo "python3 не найден" >&2; exit 1; }
+  apt-get update -qq
+  apt-get install -y -qq python3 python3-venv iptables iptables-persistent netfilter-persistent
   python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || { echo "Нужен Python 3.9 или новее" >&2; exit 1; }
-  printf '%s' "$persist" > "$STATE/persist"
-  [ -n "$persist" ] && note "автосохранение: $persist"
+  # address lists are ipset sets; ipset-persistent restores them before the rules at boot
+  if apt-get install -y -qq ipset ipset-persistent; then
+    if ipset create -exist linfw_probe hash:net && ipset destroy linfw_probe; then
+      note "iptables-persistent, ipset-persistent"
+    else
+      warn_note "ipset недоступен в ядре: адресные списки не будут работать (в контейнере: modprobe ip_set ip_set_hash_net на хосте)"
+    fi
+  else
+    warn_note "не удалось поставить ipset-persistent: адресные списки не переживут перезагрузку"
+  fi
+  printf '%s' "netfilter-persistent" > "$STATE/persist"
   return 0
 }
 
@@ -264,6 +270,7 @@ main() {
   LOG="$STATE/install.log"
   NOTE_FILE="$STATE/note"
   WARN_FILE="$STATE/warn"
+  FATAL_FILE="$STATE/fatal"
   : > "$LOG"
   trap cleanup EXIT
   trap 'exit 130' INT TERM

@@ -37,15 +37,19 @@ _VERB = {"accept": ("Разрешает", GREEN), "drop": ("Отбрасывае
 _PROTOCOL = {"all": "весь трафик", "tcp": "TCP", "udp": "UDP", "icmp": "ICMP (ping)"}
 
 
+def _who(value: str) -> str:
+    return f"списка «{value[1:]}»" if value.startswith("@") else value
+
+
 def describe_rule(rule: "Rule", pkts: int, nbytes: int) -> Text:
     """One readable sentence about a rule: what it does, to whom, and how busy it is."""
     verb, colour = _VERB.get(rule.action, (rule.action, MUTED))
     what = _PROTOCOL.get(rule.protocol, rule.protocol)
     where = ""
     if rule.source:
-        where += f" от {rule.source}"
+        where += f" от {_who(rule.source)}"
     if rule.destination:
-        where += f" к {rule.destination}"
+        where += f" к {_who(rule.destination)}"
     if rule.port:
         where += f", порт {rule.port}"
     out = Text()
@@ -104,9 +108,17 @@ def _picked(dialog: ModalScreen, name: str) -> str:
 class AddRuleScreen(ModalScreen[Optional[NewRule]]):
     BINDINGS = [Binding("escape", "cancel", "Отмена")]
 
-    def __init__(self, chain: str = "INPUT", rule: Optional[Rule] = None) -> None:
+    def __init__(
+        self,
+        chain: str = "INPUT",
+        rule: Optional[Rule] = None,
+        lists: Optional[Dict[str, int]] = None,
+        lists_problem: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self._rule = rule  # set when editing an existing rule
+        self._lists = lists or {}  # name -> number of addresses, for the «Список» button
+        self._lists_problem = lists_problem
         self._initial = rule.to_new() if rule else NewRule(chain if chain in CHAINS else "INPUT")
 
     def compose(self) -> ComposeResult:
@@ -126,10 +138,12 @@ class AddRuleScreen(ModalScreen[Optional[NewRule]]):
             )
             with Horizontal(classes="row"):
                 yield Label("Source", classes="label")
-                yield Input(init.source, placeholder="any или 192.168.1.0/24", id="source")
+                yield Input(init.source, placeholder="any, 192.168.1.0/24 или @список", id="source")
+                yield Button("Список ▾", id="pick-source", classes="pick")
             with Horizontal(classes="row"):
                 yield Label("Destination", classes="label")
-                yield Input(init.destination, placeholder="any или 10.0.0.5", id="destination")
+                yield Input(init.destination, placeholder="any, 10.0.0.5 или @список", id="destination")
+                yield Button("Список ▾", id="pick-destination", classes="pick")
             with Horizontal(classes="row"):
                 yield Label("Port", classes="label")
                 yield Input(
@@ -149,6 +163,21 @@ class AddRuleScreen(ModalScreen[Optional[NewRule]]):
     def on_mount(self) -> None:
         self.query_one("#error", Label).display = False
         self.query_one("#source", Input).focus()
+
+    @on(Button.Pressed, ".pick")
+    def _pick_list(self, event: Button.Pressed) -> None:
+        field = self.query_one("#" + (event.button.id or "pick-source")[5:], Input)
+        if self._lists_problem:
+            self.query_one("#error", Label).update(f"Списки недоступны: {self._lists_problem}")
+            self.query_one("#error", Label).display = True
+            return
+
+        def chosen(name: Optional[str]) -> None:
+            if name:
+                field.value = "@" + name
+            field.focus()
+
+        self.app.push_screen(PickListScreen(self._lists), chosen)
 
     @on(Segmented.Changed, "#protocol")
     def _protocol_changed(self) -> None:
@@ -230,16 +259,67 @@ class TemplateScreen(ModalScreen[Optional[NewRule]]):
         self.dismiss(None)
 
 
+class PickListScreen(ModalScreen[Optional[str]]):
+    """Choose one of the address lists for a rule's source or destination."""
+
+    BINDINGS = [Binding("escape", "cancel", "Отмена")]
+
+    def __init__(self, lists: Dict[str, int]) -> None:
+        super().__init__()
+        self._names = sorted(lists)
+        self._counts = lists
+
+    def compose(self) -> ComposeResult:
+        width = max((len(n) for n in self._names), default=0)
+        with Vertical(classes="dialog"):
+            yield Label("Выберите список", classes="title")
+            if self._names:
+                yield OptionList(
+                    *[
+                        Option(
+                            Text.assemble((f"@{n}".ljust(width + 1), "bold"), "   ", (f"{self._counts[n]} адресов", "dim")),
+                            id=n,
+                        )
+                        for n in self._names
+                    ]
+                )
+            else:
+                yield Label("Списков пока нет. Создайте их в окне «Списки» (F8).", classes="hint")
+            with Horizontal(classes="buttons"):
+                if self._names:
+                    yield Button("Выбрать", variant="success", id="apply")
+                yield Button("Отмена", id="cancel")
+
+    def on_mount(self) -> None:
+        if self._names:
+            options = self.query_one(OptionList)
+            options.highlighted = 0
+            options.focus()
+
+    @on(OptionList.OptionSelected)
+    def _selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(self._names[event.option_index])
+
+    @on(Button.Pressed, "#apply")
+    def _apply(self) -> None:
+        self.dismiss(self._names[self.query_one(OptionList).highlighted or 0])
+
+    @on(Button.Pressed, "#cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ConfirmScreen(ModalScreen[bool]):
     BINDINGS = [Binding("escape,n", "no", "Нет"), Binding("y", "yes", "Да")]
 
-    def __init__(self, question: str) -> None:
+    def __init__(self, question: str, title: str = "Удалить правило?") -> None:
         super().__init__()
         self._question = question
+        self._title = title
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog"):
-            yield Label("Удалить правило?", classes="title")
+            yield Label(self._title, classes="title")
             yield Label(self._question, classes="hint")
             with Horizontal(classes="buttons"):
                 yield Button("Удалить", variant="error", id="yes")

@@ -5,6 +5,8 @@ import shlex
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from .lists import list_ref, set_name
+
 CHAINS = ("INPUT", "OUTPUT", "FORWARD")
 PROTOCOLS = ("all", "tcp", "udp", "icmp")
 ACTIONS = ("ACCEPT", "DROP", "REJECT")
@@ -155,14 +157,19 @@ class NewRule:
             bool(self.log),
         )
 
+    def used_lists(self) -> List[str]:
+        return [n for n in (list_ref(self.source), list_ref(self.destination)) if n]
+
     def to_spec(self) -> List[str]:
         spec: List[str] = []
         if self.protocol != "all":
             spec += ["-p", self.protocol]
-        if self.source:
-            spec += ["-s", self.source]
-        if self.destination:
-            spec += ["-d", self.destination]
+        for flag, value, direction in (("-s", self.source, "src"), ("-d", self.destination, "dst")):
+            name = list_ref(value) if value else None
+            if name:
+                spec += ["-m", "set", "--match-set", set_name(name), direction]
+            elif value:
+                spec += [flag, value]
         if self.port:
             if "," in self.port:
                 spec += ["-m", "multiport", "--dports", self.port]
@@ -184,6 +191,10 @@ def _normalize_address(value: str, label: str) -> str:
     value = value.strip()
     if value.lower() in ("", "any", "anywhere", "*"):
         return ""
+    if value.startswith("@"):
+        if not list_ref(value):
+            raise ValueError(f"{label}: неверное имя списка (латиница, цифры, «_», «-», «.»)")
+        return value  # the list itself is checked against the existing ones when the rule is applied
     try:
         net = ipaddress.IPv4Network(value, strict=False)
     except ValueError:

@@ -13,6 +13,7 @@ from textual.widgets import Button, DataTable, Label, Static, Tab, Tabs
 from .firewall import Firewall
 from .model import CHAINS, FirewallError, NewRule, Rule
 from .parser import Snapshot
+from .lists_ui import ListsScreen
 from .screens import (
     AddRuleScreen,
     ConfirmScreen,
@@ -23,7 +24,7 @@ from .screens import (
     key_label,
     rule_summary,
 )
-from .theme import ACTION_STYLE, LINFW_THEME, POLICY_STYLE
+from .theme import ACTION_STYLE, BLUE, LINFW_THEME, POLICY_STYLE
 COLUMNS = ("#", "Pkts", "chain", "protocol", "source", "destination", "port", "action")
 REFRESH_SECONDS = 2.0
 
@@ -48,8 +49,8 @@ def row_cells(rule: Rule, pkts: Optional[int] = None) -> List[Text]:
         Text(humanize(rule.pkts if pkts is None else pkts), style=dim, justify="right"),
         Text(rule.chain.lower(), style="dim"),
         Text(rule.protocol, style=dim or (quiet if rule.protocol == "all" else "")),
-        Text(rule.source or "any", style=dim or ("" if rule.source else quiet)),
-        Text(rule.destination or "any", style=dim or ("" if rule.destination else quiet)),
+        Text(rule.source or "any", style=dim or (BLUE if rule.source.startswith("@") else "" if rule.source else quiet)),
+        Text(rule.destination or "any", style=dim or (BLUE if rule.destination.startswith("@") else "" if rule.destination else quiet)),
         Text((rule.port or "-") + (" +" if rule.extra else ""), style=dim or ("bold" if rule.port else quiet)),
         Text(action, style="dim" if not rule.enabled else ACTION_STYLE.get(rule.action, "bold")),
     ]
@@ -78,17 +79,29 @@ class LinFWApp(App):
     CSS = """
     Screen { background: $background; }
     #toolbar { height: 1; padding: 0 1; background: $panel; }
-    #toolbar Button, #jbar Button {
+    #toolbar Button, #jbar Button, #lbar Button {
         min-width: 0; height: 1; border: none; padding: 0 1; margin: 0;
         background: transparent; color: $text;
     }
-    #toolbar Button:hover, #jbar Button:hover { background: $primary 35%; }
+    #toolbar Button:hover, #jbar Button:hover, #lbar Button:hover { background: $primary 35%; }
+    #lbar .sep { width: 1; color: $text-muted; margin: 0 1; }
     #toolbar Button:disabled { opacity: 0.35; }
     #toolbar #btn-delete:hover { background: $error 45%; }
     #toolbar .sep, #jbar .sep { width: 1; color: $text-muted; margin: 0 1; }
     #chains { height: 2; background: $background; }
     #chains Tab { padding: 0 2; }
     #rules { height: 1fr; background: $background; }
+    .row Button.pick { min-width: 0; width: auto; height: 1; border: none; padding: 0 1; margin-left: 1; background: $boost; color: $accent; }
+    .row Button.pick:hover { background: $primary 35%; }
+    #lists-pane { height: 1fr; }
+    #lists, #entries { height: 1fr; border: round $panel-lighten-3; background: $background; }
+    #lists { width: 46; }
+    #lists:focus, #entries:focus { border: round $primary; }
+    #lbar { height: 1; padding: 0 1; background: $panel; }
+    #lbar .spacer { width: 1fr; }
+    #lstatus { height: auto; min-height: 1; padding: 0 1; color: $text-muted; background: $surface; }
+    TextArea { height: 8; border: round $panel-lighten-3; background: $boost; }
+    TextArea:focus { border: round $primary; }
     #empty { height: 1fr; content-align: center middle; text-align: center; color: $text-muted; }
     DataTable > .datatable--header { background: $panel; color: $text-muted; text-style: bold; }
     DataTable > .datatable--odd-row { background: $surface; }
@@ -137,6 +150,7 @@ class LinFWApp(App):
         Binding("f5,d", "move(1)", "Вниз"),
         Binding("f6,space", "toggle", "Выключить"),
         Binding("f7,j", "journal", "Журнал"),
+        Binding("f8,l", "lists", "Списки"),
         Binding("r", "refresh_now", "Обновить"),
         Binding("f10,q,ctrl+q", "quit", "Выход"),
         Binding("escape", "leave", "Выход"),
@@ -156,6 +170,7 @@ class LinFWApp(App):
         self._persist_note = ""
         self._base_failed = False
         self._totals: Dict[str, Tuple[int, int]] = {}  # running totals that survive counter resets
+        self._lists_info: Tuple[Dict[str, int], Optional[str]] = ({}, None)  # (name -> size, why unavailable)
 
     # -- layout ----------------------------------------------------------
 
@@ -165,11 +180,12 @@ class LinFWApp(App):
             yield ToolButton(key_label("F2", "Удалить"), id="btn-delete")
             yield ToolButton(key_label("F3", "Шаблон"), id="btn-template")
             yield Static("│", classes="sep")
-            yield ToolButton(key_label("F4", "▲ Вверх"), id="btn-up")
-            yield ToolButton(key_label("F5", "▼ Вниз"), id="btn-down")
+            yield ToolButton(key_label("F4", "▲"), id="btn-up")
+            yield ToolButton(key_label("F5", "▼"), id="btn-down")
             yield ToolButton(key_label("F6", "Выключить"), id="btn-toggle")
             yield Static("│", classes="sep")
             yield ToolButton(key_label("F7", "Журнал"), id="btn-journal")
+            yield ToolButton(key_label("F8", "Списки"), id="btn-lists")
             yield ToolButton(key_label("F10", "Выход"), id="btn-quit")
         yield ChainTabs(*[Tab(name, id=f"tab-{name}") for name in CHAINS], id="chains")
         # "renderable": the green/red/orange action text stays coloured under the cursor
@@ -246,6 +262,7 @@ class LinFWApp(App):
     async def _load_snapshot(self) -> None:
         self.snapshot = await asyncio.to_thread(self.fw.snapshot)
         self._totals = await asyncio.to_thread(self.fw.counter_totals, self.snapshot)
+        self._lists_info = await asyncio.to_thread(self.fw.lists_overview)
 
     def _visible(self) -> List[Rule]:
         return [r for r in self.snapshot.rules.get(self.current, []) if not r.hidden]
@@ -410,7 +427,7 @@ class LinFWApp(App):
             if rule:
                 self.run_worker(self._add(rule, "Правило добавлено"))
 
-        self.push_screen(AddRuleScreen(self.current), done)
+        self.push_screen(AddRuleScreen(self.current, None, *self._lists_info), done)
 
     @on(Button.Pressed, "#btn-template")
     def action_template(self) -> None:
@@ -451,7 +468,7 @@ class LinFWApp(App):
             if new:
                 self.run_worker(self._edit(rule, new))
 
-        self.push_screen(AddRuleScreen(rule.chain, rule), done)
+        self.push_screen(AddRuleScreen(rule.chain, rule, *self._lists_info), done)
 
     async def _edit(self, rule: Rule, new: NewRule) -> None:
         if await self._apply("Правило изменено", lambda: self.fw.edit(rule, new)):
@@ -513,6 +530,11 @@ class LinFWApp(App):
     @on(Button.Pressed, "#btn-journal")
     def action_journal(self) -> None:
         self.push_screen(JournalScreen(self.fw))
+
+    @on(Button.Pressed, "#btn-lists")
+    def action_lists(self) -> None:
+        # the rule dialogs read the lists from a cache: refresh it when the lists window closes
+        self.push_screen(ListsScreen(self.fw), lambda _: self.run_worker(self._refresh()))
 
     @on(Button.Pressed, "#btn-toggle")
     def action_toggle(self) -> None:

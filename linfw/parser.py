@@ -5,6 +5,7 @@ import shlex
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Sequence, Set
 
+from .lists import LIST_PREFIX
 from .model import CHAINS, OFF_PREFIX, Rule
 
 _COUNTERS = re.compile(r"^\[(\d+):(\d+)\]\s+(.*)$")
@@ -26,6 +27,16 @@ def _address(value: str) -> str:
     if value == "0.0.0.0/0":
         return ""
     return value[:-3] if value.endswith("/32") else value
+
+
+def _our_set(tokens: Sequence[str], i: int) -> bool:
+    """tokens[i:] starts with `-m set --match-set lf_<name> src|dst`."""
+    return (
+        i + 4 < len(tokens)
+        and tokens[i + 2] == "--match-set"
+        and tokens[i + 3].startswith(LIST_PREFIX)
+        and tokens[i + 4] in ("src", "dst")
+    )
 
 
 def parse_rule(chain: str, index: int, pkts: int, nbytes: int, tokens: Sequence[str]) -> Rule:
@@ -57,6 +68,13 @@ def parse_rule(chain: str, index: int, pkts: int, nbytes: int, tokens: Sequence[
             target = arg
         elif tok == "--reject-with":
             pass
+        elif tok == "-m" and arg == "set" and not bang and _our_set(tokens, i):
+            ref = "@" + tokens[i + 3][len(LIST_PREFIX):]
+            if tokens[i + 4] == "src":
+                source = ref
+            else:
+                destination = ref
+            step = 5
         elif tok == "-m" and arg in _IMPLIED_MODULES:
             pass
         elif tok == "-m":

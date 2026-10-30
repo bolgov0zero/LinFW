@@ -17,7 +17,7 @@ _SAMPLE = [
     ("INPUT", "-p tcp --dport 22 -j ACCEPT", 1532),
     ("INPUT", "-p tcp -m multiport --dports 80,443 -j ACCEPT", 20871),
     ("INPUT", "-p icmp -j ACCEPT", 87),
-    ("INPUT", "-s 203.0.113.0/24 -j DROP", 311),
+    ("INPUT", "-m set --match-set lf_blocklist src -j DROP", 311),
     ("INPUT", "-p udp --dport 161 -s 10.0.0.0/8 -j REJECT --reject-with icmp-port-unreachable", 12),
     ("INPUT", "-j DROP", 5400),
     ("OUTPUT", "-p tcp -d 198.51.100.7 --dport 25 -j DROP", 3),
@@ -46,6 +46,13 @@ class DemoRunner:
         self.rules: Dict[str, List[List]] = {c: [] for c in CHAINS}  # [pkts, bytes, tokens]
         self.persist_calls = 0
         self._jitter = jitter
+        # address lists: ipset name -> entries (the real thing lives in the kernel)
+        self.sets: Dict[str, List[str]] = {}
+        if sample:
+            self.sets = {
+                "lf_office": ["192.168.1.0/24", "10.0.0.5"],
+                "lf_blocklist": ["198.51.100.7", "203.0.113.0/24"],
+            }
         self._hits: List[LogEntry] = []
         if sample:
             for _ in range(24):
@@ -67,7 +74,15 @@ class DemoRunner:
             return args[:i] + args[i + 3:], int(args[i + 1]), int(args[i + 2])
         return args, 0, 0
 
+    def _check_sets(self, tokens: List[str]) -> None:
+        """The kernel refuses a rule that names a set that does not exist."""
+        for i, tok in enumerate(tokens[:-1]):
+            if tok == "--match-set" and tokens[i + 1] not in self.sets:
+                raise FirewallError(f"iptables: Set {tokens[i + 1]} doesn't exist.")
+
     def ipt(self, args: List[str]) -> None:
+        if args[0] in ("-A", "-I", "-R"):
+            self._check_sets(args)
         op, rest = args[0], args[1:]
         if op == "-N":
             if rest[0] in self.user_chains:
@@ -130,6 +145,47 @@ class DemoRunner:
 
     def logd_state(self) -> Optional[str]:
         return "active"
+
+    def ipset(self, args: List[str], stdin: Optional[str] = None) -> str:
+        """The few ipset commands LinFW uses, on in-memory sets."""
+        cmd = args[0]
+        if cmd == "list":
+            return "".join(f"{name}\n" for name in self.sets)
+        if cmd == "save":
+            out = []
+            for name, entries in self.sets.items():
+                out.append(f"create {name} hash:net family inet hashsize 1024 maxelem 262144")
+                out += [f"add {name} {e}" for e in entries]
+            return "\n".join(out) + ("\n" if out else "")
+        if cmd == "create":
+            if args[1] in self.sets:
+                raise FirewallError("Set cannot be created: set with the same name already exists")
+            self.sets[args[1]] = []
+        elif cmd == "destroy":
+            name = args[1]
+            if name not in self.sets:
+                raise FirewallError("The set with the given name does not exist")
+            if any(name in tokens for chain in self.rules.values() for _, _, tokens in chain):
+                raise FirewallError("Set cannot be destroyed: it is in use by a kernel component")
+            del self.sets[name]
+        elif cmd == "restore":
+            for line in (stdin or "").splitlines():
+                verb, name, entry = line.split()[:3]
+                if name not in self.sets:
+                    raise FirewallError("The set with the given name does not exist")
+                if verb == "add" and entry not in self.sets[name]:
+                    self.sets[name].append(entry)
+                elif verb == "del" and entry in self.sets[name]:
+                    self.sets[name].remove(entry)
+        else:
+            raise FirewallError(f"demo: unsupported ipset command {cmd}")
+        return ""
+
+    def ipset_problem(self) -> Optional[str]:
+        return None
+
+    def ipset_persistent(self) -> bool:
+        return True
 
     def persist(self) -> str:
         self.persist_calls += 1

@@ -341,7 +341,8 @@ async def test_exit_button_closes_the_app():
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.pause()
         buttons = [str(b.label) for b in app.query("#toolbar Button")]
-        assert buttons[-2:] == ["F7 Журнал", "F10 Выход"]  # the exit button sits right of the journal
+        assert buttons[-3:] == ["F7 Журнал", "F8 Списки", "F10 Выход"]  # exit stays at the right end
+        assert "F4 ▲" in buttons and "F5 ▼" in buttons  # the move buttons are arrows only
         await pilot.click("#btn-quit")
         await pilot.pause(0.5)
         assert not app.is_running

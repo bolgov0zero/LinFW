@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
-from . import journal, persist
+from . import journal, lists as lst, persist
 from .counters import CounterStore, assign_keys, signature, store_key
 from .journal import LogEntry
 from .model import (
@@ -55,6 +56,31 @@ class SystemRunner:
     def read_journal(self, chain: Optional[str] = None, actions=None, limit: int = journal.MAX_ENTRIES) -> Tuple[str, List[LogEntry]]:
         return journal.read_entries(chain, actions, limit)
 
+    def ipset(self, args: List[str], stdin: Optional[str] = None) -> str:
+        binary = persist.find_binary("ipset")
+        if not binary:
+            raise FirewallError("Не установлен пакет ipset: адресные списки недоступны")
+        try:
+            r = subprocess.run([binary, *args], input=stdin, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            raise FirewallError("ipset не ответил за 30 секунд") from None
+        if r.returncode:
+            message = (r.stderr or r.stdout).strip().splitlines()[0] if (r.stderr or r.stdout).strip() else ""
+            raise FirewallError(message.split(": ", 1)[-1] or f"ipset завершился с кодом {r.returncode}")
+        return r.stdout
+
+    def ipset_problem(self) -> Optional[str]:
+        """Why address lists cannot be used here, or None if they can."""
+        try:
+            self.ipset(["list", "-n"])
+        except FirewallError as exc:
+            return str(exc)
+        return None
+
+    def ipset_persistent(self) -> bool:
+        """Does a plugin save the lists and restore them before the rules at boot?"""
+        return os.path.exists("/usr/share/netfilter-persistent/plugins.d/10-ipset")
+
     def logd_state(self) -> Optional[str]:
         """systemd's view of linfw-logd ("active", "inactive", "failed" ...), None without systemd."""
         systemctl = persist.find_binary("systemctl")
@@ -91,6 +117,71 @@ class Firewall:
     def read_journal(self, chain: Optional[str] = None, actions=None, limit: int = journal.MAX_ENTRIES) -> Tuple[str, List[LogEntry]]:
         return self.runner.read_journal(chain, actions, limit)
 
+    # -- address lists ----------------------------------------------------
+
+    def lists_overview(self) -> Tuple[Dict[str, int], Optional[str]]:
+        """({name: number of addresses}, None) or ({}, the reason lists cannot be used)."""
+        try:
+            return {n: len(e) for n, e in self.lists().items()}, None
+        except FirewallError as exc:
+            return {}, str(exc)
+
+    def lists_problem(self) -> Optional[str]:
+        return self.runner.ipset_problem()
+
+    def lists_persistent(self) -> bool:
+        return self.runner.ipset_persistent()
+
+    def lists(self) -> Dict[str, List[str]]:
+        """{name: entries} of LinFW's lists."""
+        return lst.parse_save(self.runner.ipset(["save"]))
+
+    def list_usage(self, snap: Optional[Snapshot] = None) -> Dict[str, List[str]]:
+        """{name: ["INPUT #3", ...]}: which rules use each list (also negated ones)."""
+        snap = snap or self.snapshot()
+        usage: Dict[str, List[str]] = {}
+        for chain in CHAINS:
+            for rule in snap.rules[chain]:
+                if rule.hidden:
+                    continue
+                for tok in rule.spec:
+                    if tok.startswith(lst.LIST_PREFIX):
+                        usage.setdefault(tok[len(lst.LIST_PREFIX):], []).append(f"{chain} #{rule.number}")
+        return usage
+
+    def create_list(self, name: str) -> None:
+        name = lst.check_name(name)
+        if name in self.lists():
+            raise FirewallError(f"Список «{name}» уже есть")
+        self.runner.ipset(["create", lst.set_name(name), "hash:net", "family", "inet", "maxelem", str(lst.MAX_ELEMENTS)])
+
+    def delete_list(self, name: str) -> None:
+        used = self.list_usage().get(name)
+        if used:
+            raise FirewallError(f"Список «{name}» используется в правилах: {', '.join(used)}. Сначала измените или удалите их.")
+        self.runner.ipset(["destroy", lst.set_name(name)])
+
+    def add_to_list(self, name: str, entries: List[str]) -> int:
+        """Add already validated entries; returns how many were new."""
+        entries = [lst.normalize_entry(e) for e in entries]
+        have = set(self.lists().get(name, []))
+        new = [e for e in dict.fromkeys(entries) if e not in have]
+        if new:
+            self.runner.ipset(["restore", "-exist"], "".join(f"add {lst.set_name(name)} {e}\n" for e in new))
+        return len(new)
+
+    def remove_from_list(self, name: str, entries: List[str]) -> None:
+        if entries:
+            self.runner.ipset(["restore", "-exist"], "".join(f"del {lst.set_name(name)} {e}\n" for e in entries))
+
+    def _check_lists(self, new: NewRule) -> None:
+        wanted = new.used_lists()
+        if wanted:
+            existing = self.lists()
+            for name in wanted:
+                if name not in existing:
+                    raise FirewallError(f"Список «{name}» не найден: создайте его в окне «Списки» (F8)")
+
     def counter_totals(self, snap: Snapshot) -> Dict[str, Tuple[int, int]]:
         """{"CHAIN:index": (packets, bytes)} counted since the rule was first seen,
         regardless of resets. Empty if the totals cannot be kept (the UI then shows
@@ -117,6 +208,7 @@ class Firewall:
 
     def add(self, new: NewRule) -> None:
         new = new.validated()
+        self._check_lists(new)
         if new.log:
             self.runner.ipt(["-A", new.chain, *new.to_log_spec()])
         self.runner.ipt(["-A", new.chain, *new.to_spec()])
@@ -127,6 +219,7 @@ class Firewall:
         rules = self._current(rule)
         self._refuse_hidden(rule)
         new = new.validated()
+        self._check_lists(new)
         if new.chain != rule.chain:
             raise FirewallError("Цепочку существующего правила изменить нельзя")
         spec = new.to_spec()
