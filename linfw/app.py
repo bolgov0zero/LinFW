@@ -41,6 +41,7 @@ from .theme import (
 )
 
 COLUMNS = ("#", "Pkts", "chain", "protocol", "source", "destination", "port", "action")
+SPREAD = (0, 1, 1, 1, 3, 3, 1, 2)  # how the free width of the table is shared between the columns
 REFRESH_SECONDS = 2.0
 ACTIONS = ("accept", "drop", "reject")
 
@@ -97,6 +98,9 @@ class RulesTable(DataTable):
         Binding("right", "app.next_chain", show=False),
         Binding("enter", "app.edit", show=False),
     ]
+
+    def on_resize(self) -> None:
+        self.app.fit_columns()
 
     def on_click(self, event: events.Click) -> None:
         # double click on a data row (not the header) edits it
@@ -402,11 +406,34 @@ class LinFWApp(App):
                 table.move_cursor(row=new_keys.index(target), animate=False)
             table.scroll_y = scroll
         self._shown = rules
+        self.fit_columns()
         self._show_empty(not rules)
         self._update_tabs()
         self._update_detail()
         self._update_stats()
         self._update_status()
+
+    def fit_columns(self) -> None:
+        """Stretch the columns over the whole width of the table: every column keeps what its
+        widest cell needs and the free space is shared out (more to addresses, none to «#»)."""
+        table = self.table
+        width = table.scrollable_content_region.width
+        if width <= 0:
+            return
+        need = [len(name) for name in COLUMNS]
+        for rule in self._shown or []:
+            for i, cell in enumerate(row_cells(rule, self._pkts(rule))):
+                need[i] = max(need[i], cell.cell_len)
+        free = max(width - sum(need) - 2 * table.cell_padding * len(COLUMNS), 0)
+        weights = sum(SPREAD)
+        given = 0
+        for i, (name, column) in enumerate(zip(COLUMNS, table.columns.values())):
+            share = free * SPREAD[i] // weights if i < len(COLUMNS) - 1 else free - given
+            given += share
+            column.auto_width = False
+            column.width = need[i] + share
+        table._require_update_dimensions = True
+        table.refresh(layout=True)
 
     def _selected_rule(self) -> Optional[Rule]:
         table = self.table
