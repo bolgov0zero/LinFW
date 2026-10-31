@@ -449,8 +449,6 @@ class JournalScreen(Screen):
             yield sep()
             yield ToolButton(key_label("F5", "обновить"), id="jrefresh")
             yield sep()
-            yield ToolButton(key_label("?", "ещё"), id="jhelp")
-            yield sep()
             yield ToolButton(key_label("Esc", "← к правилам"), id="jback")
         yield StatusBar("Журнал")
 
@@ -616,7 +614,6 @@ class JournalScreen(Screen):
     def action_refresh_now(self) -> None:
         self.run_worker(self._load(), exclusive=True)
 
-    @on(Button.Pressed, "#jhelp")
     def action_help(self) -> None:
         self.app.push_screen(HelpScreen())
 

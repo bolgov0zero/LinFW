@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 from rich.text import Text
@@ -11,7 +10,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import Button, DataTable, Static, Tab, Tabs
 
-from .chrome import Meter, StatusBar, ToolButton, TopBar, fit_title, key_label, row, sep, spark
+from .chrome import StatusBar, ToolButton, TopBar, fit_title, key_label, row, sep
 from .firewall import Firewall
 from .model import CHAINS, FirewallError, NewRule, Rule
 from .parser import Snapshot
@@ -43,7 +42,6 @@ from .theme import (
 
 COLUMNS = ("#", "Pkts", "chain", "protocol", "source", "destination", "port", "action")
 REFRESH_SECONDS = 2.0
-HISTORY = 28  # packets-per-second samples kept for the little graph
 ACTIONS = ("accept", "drop", "reject")
 
 
@@ -157,11 +155,10 @@ class LinFWApp(App):
     #chains Tab:hover { color: $text; background: $primary 10%; }
     #chains Tab.-active { color: $pink; text-style: bold; background: transparent; }
     #chains .underline--bar { color: $pink; background: $line-soft; }
-    #meter { margin-top: 1; }
     #stats { height: 7; }
     .panel { width: 1fr; height: 7; padding: 0 1; }
     #stat-packets { margin-left: 1; }
-    .compact #stats, .compact #meter { display: none; }
+    .compact #stats { display: none; }
     #rules { height: 1fr; }
     #empty { height: 1fr; content-align: center middle; text-align: center; color: $dim; }
     #detail { height: 4; padding: 0 1; }
@@ -258,16 +255,12 @@ class LinFWApp(App):
         self._base_failed = False
         self._totals: Dict[str, Tuple[int, int]] = {}  # running totals that survive counter resets
         self._lists_info: Tuple[Dict[str, int], Optional[str]] = ({}, None)  # (name -> size, why unavailable)
-        self._hist: List[int] = [0] * HISTORY  # packets per second, newest last
-        self._last_total: Optional[int] = None
-        self._last_at = 0.0
 
     # -- layout ----------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         yield TopBar("iptables", self.current)
         yield ChainTabs(*[Tab(name, id=f"tab-{name}") for name in CHAINS], id="chains")
-        yield Meter()
         with Horizontal(id="stats"):
             left, right = Static("", id="stat-chain", classes="panel"), Static("", id="stat-packets", classes="panel")
             left.border_title = "Цепочка"
@@ -300,8 +293,6 @@ class LinFWApp(App):
             yield ToolButton(key_label("F7", "журнал"), id="btn-journal")
             yield sep()
             yield ToolButton(key_label("F8", "списки"), id="btn-lists")
-            yield sep()
-            yield ToolButton(key_label("?", "ещё"), id="btn-help")
             yield sep()
             yield ToolButton(key_label("F10", "выход"), id="btn-quit")
         yield StatusBar("Правила")
@@ -376,17 +367,6 @@ class LinFWApp(App):
         self.snapshot = await asyncio.to_thread(self.fw.snapshot)
         self._totals = await asyncio.to_thread(self.fw.counter_totals, self.snapshot)
         self._lists_info = await asyncio.to_thread(self.fw.lists_overview)
-        self._sample_rate()
-
-    def _sample_rate(self) -> None:
-        """Packets per second over all chains, from the running totals: feeds the little graph."""
-        now = time.monotonic()
-        total = sum(self._pkts(r) for rules in self.snapshot.rules.values() for r in rules if not r.hidden)
-        if self._last_total is not None and now - self._last_at < 1.0:
-            return  # samples are taken about once per refresh; a change made by hand does not skew the rate
-        if self._last_total is not None:
-            self._hist = (self._hist + [round(max(total - self._last_total, 0) / (now - self._last_at))])[-HISTORY:]
-        self._last_total, self._last_at = total, now
 
     def _visible(self) -> List[Rule]:
         return [r for r in self.snapshot.rules.get(self.current, []) if not r.hidden]
@@ -504,7 +484,7 @@ class LinFWApp(App):
         main.query_one(StatusBar).set_right(f"правил: {total} · списков: {len(self._lists_info[0])}")
 
     def _update_stats(self) -> None:
-        """The meter and the two panels: what this chain has and how its packets split between the actions."""
+        """The two panels: what this chain has and how its packets split between the actions."""
         main = self._main()
         rules = self._visible()
         packets = {a: 0 for a in ACTIONS}
@@ -515,15 +495,6 @@ class LinFWApp(App):
             nbytes += self._totals.get(r.key, (r.pkts, r.bytes))[1]
         total = sum(packets.values())
         on = sum(1 for r in rules if r.enabled)
-        left = Text.assemble((str(on), "bold"), f" / {len(rules)} ", ("включено", MUTED))
-        drop = f"{packets['drop'] / total * 100:.2f}%" if total else "0%"
-        rate = self._hist[-1]
-        main.query_one(Meter).show(
-            [(packets[a], ACTION_COLOR[a]) for a in ACTIONS],
-            Text.assemble((drop, "bold"), (" drop", MUTED)),
-            left,
-            Text.assemble((str(rate), f"bold {BLUE}"), (" пак/с ", MUTED), spark(self._hist)),
-        )
         chain_panel, packets_panel = main.query_one("#stat-chain", Static), main.query_one("#stat-packets", Static)
         width = chain_panel.content_size.width
         if width < 12:
@@ -607,7 +578,6 @@ class LinFWApp(App):
 
         self.push_screen(AddRuleScreen(self.current, None, *self._lists_info), done)
 
-    @on(Button.Pressed, "#btn-help")
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
 

@@ -341,7 +341,7 @@ async def test_exit_button_closes_the_app():
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.pause()
         buttons = [str(b.label) for b in app.query("#helpbar Button")]
-        assert buttons[-3:] == ["F8 списки", "? ещё", "F10 выход"]  # exit stays at the right end
+        assert buttons[-3:] == ["F7 журнал", "F8 списки", "F10 выход"]  # exit stays at the right end
         assert "F4 ▲" in buttons and "F5 ▼" in buttons  # the move buttons are arrows only
         await pilot.click("#btn-quit")
         await pilot.pause(0.5)
@@ -567,7 +567,7 @@ async def test_interface_polish_theme_tabs_empty_state_and_toolbar():
 async def test_deep_blue_look_header_meter_panels_and_dialog_frames():
     from textual.widgets import Static
 
-    from linfw.chrome import Meter, StatusBar, TopBar
+    from linfw.chrome import StatusBar, TopBar
     from linfw.screens import HelpScreen
 
     app, _ = make_app()
@@ -589,7 +589,7 @@ async def test_deep_blue_look_header_meter_panels_and_dialog_frames():
         assert "отклонено" in str(app.query_one("#stat-packets").border_title)
         assert "Правило 1 из 6" in str(app.query_one("#rules").border_subtitle)
         assert "правил: 10" in str(app.query_one("#sb-right", Static).render())
-        assert app.query_one(Meter).display and app.query_one(TopBar) and app.query_one(StatusBar)
+        assert app.query_one(TopBar) and app.query_one(StatusBar) and not app.query("#meter")
 
         # dialogs carry their title and key hints in the border
         await pilot.press("f1")
@@ -611,7 +611,7 @@ async def test_short_terminal_hides_the_meter_and_panels():
     app, _ = make_app()
     async with app.run_test(size=(120, 26)) as pilot:
         await pilot.pause(0.5)
-        assert not app.query_one("#stats").display and not app.query_one("#meter").display
+        assert not app.query_one("#stats").display
         assert app.query_one("#rules").region.height >= 6
 
 

@@ -11,10 +11,7 @@ from textual.widget import Widget
 from textual.widgets import Button, Static
 
 from . import __version__
-from .theme import AMBER, BACKGROUND, FAINT, GREEN, MUTED, PINK, VIOLET
-
-SPARK = "▁▂▃▄▅▆▇█"
-
+from .theme import AMBER, BACKGROUND, FAINT, GREEN, MUTED, PINK
 
 def crumb(*parts: str) -> Text:
     """`iptables › INPUT`: the way to the current screen, the last step in pink."""
@@ -48,11 +45,6 @@ def hint(key: str, name: str) -> Static:
 
 def sep() -> Static:
     return Static("·", classes="sep")
-
-
-def spark(values: Sequence[int]) -> Text:
-    top = max(values, default=0) or 1
-    return Text("".join(SPARK[min(7, int(v / top * 7.99))] for v in values), style=VIOLET)
 
 
 def row(label: Text, value: Text, width: int) -> Text:

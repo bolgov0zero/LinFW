@@ -127,8 +127,6 @@ class ListsScreen(Screen):
         with Horizontal(id="helpbar"):
             yield hint("↑/↓", "выбор")
             yield sep()
-            yield hint("Tab", "панель")
-            yield sep()
             yield ToolButton(key_label("N", "новый список"), id="l-new")
             yield sep()
             yield ToolButton(key_label("A", "добавить адреса"), id="l-add")
@@ -136,8 +134,6 @@ class ListsScreen(Screen):
             yield ToolButton(key_label("X", "удалить список"), id="l-del")
             yield sep()
             yield ToolButton(key_label("Del", "удалить адрес"), id="l-delentry")
-            yield sep()
-            yield ToolButton(key_label("?", "ещё"), id="l-help")
             yield sep()
             yield ToolButton(key_label("Esc", "← к правилам"), id="l-back")
         yield StatusBar("Списки")
@@ -304,7 +300,6 @@ class ListsScreen(Screen):
         entry = entries[table.cursor_row]
         self.run_worker(self._do(lambda _: f"Адрес {entry} удалён", lambda: self.fw.remove_from_list(name, [entry]), select=name))
 
-    @on(Button.Pressed, "#l-help")
     def action_help(self) -> None:
         self.app.push_screen(HelpScreen())
 
