@@ -8,28 +8,28 @@ from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, Input, Label, Static, TextArea
 
 from . import lists as lst
 from .model import FirewallError
-from .screens import ConfirmScreen, ToolButton, key_label
-from .theme import BLUE, ORANGE, RED
+from .chrome import StatusBar, TopBar, hint, sep
+from .screens import ConfirmScreen, HelpScreen, ToolButton, dialog, key_label
+from .theme import BLUE, GREEN, ORANGE, RED
 
 
 class NewListScreen(ModalScreen[Optional[str]]):
     BINDINGS = [Binding("escape", "cancel", "Отмена")]
 
     def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog"):
-            yield Label("Новый список", classes="title")
+        with dialog("Новый список", ("⏎", "создать"), ("esc", "закрыть")):
             with Horizontal(classes="row"):
                 yield Label("Название", classes="label")
                 yield Input(placeholder="например office", id="name")
             yield Label("", id="error")
             with Horizontal(classes="buttons"):
-                yield Button("Создать", variant="success", id="ok")
+                yield Button("Создать", id="ok")
                 yield Button("Отмена", id="cancel")
 
     def on_mount(self) -> None:
@@ -63,13 +63,12 @@ class AddAddressesScreen(ModalScreen[Optional[List[str]]]):
         self._list_name = list_name
 
     def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog wide"):
-            yield Label(f"Добавить адреса в @{self._list_name}", classes="title")
+        with dialog(f"Добавить адреса в @{self._list_name}", ("tab", "к кнопкам"), ("esc", "закрыть"), classes="dialog wide"):
             yield TextArea(id="text")
             yield Label("IP-адреса и сети, по одному в строке или через пробел/запятую: 10.0.0.5, 192.168.1.0/24", classes="hint")
             yield Label("", id="error")
             with Horizontal(classes="buttons"):
-                yield Button("Добавить", variant="success", id="ok")
+                yield Button("Добавить", id="ok")
                 yield Button("Отмена", id="cancel")
 
     def on_mount(self) -> None:
@@ -101,6 +100,7 @@ class ListsScreen(Screen):
         Binding("a,insert", "add_entries", show=False),
         Binding("x", "delete_list", show=False),
         Binding("delete", "delete_entry", show=False),
+        Binding("question_mark", "help", show=False),
     ]
 
     def __init__(self, firewall) -> None:
@@ -113,22 +113,34 @@ class ListsScreen(Screen):
         self._current: Optional[str] = None
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="lbar"):
-            yield ToolButton(key_label("N", "Новый список"), id="l-new")
-            yield ToolButton(key_label("A", "Добавить адреса"), id="l-add")
-            yield Static("│", classes="sep")
-            yield ToolButton(key_label("X", "Удалить список"), id="l-del")
-            yield ToolButton(key_label("Del", "Удалить адрес"), id="l-delentry")
-            yield Static("", classes="spacer")
-            yield ToolButton(key_label("Esc", "← К правилам"), id="l-back")
+        yield TopBar("linfw", "Списки")
         with Horizontal(id="lists-pane"):
-            lists = DataTable(id="lists", cursor_type="row", zebra_stripes=True)
+            lists = DataTable(id="lists", cursor_type="row")
             lists.border_title = "Списки"
-            entries = DataTable(id="entries", cursor_type="row", zebra_stripes=True)
+            entries = DataTable(id="entries", cursor_type="row")
             entries.border_title = "Адреса"
             yield lists
             yield entries
-        yield Static("", id="lstatus")
+        status = Static("", id="lstatus")
+        status.border_title = "Состояние"
+        yield status
+        with Horizontal(id="helpbar"):
+            yield hint("↑/↓", "выбор")
+            yield sep()
+            yield hint("Tab", "панель")
+            yield sep()
+            yield ToolButton(key_label("N", "новый список"), id="l-new")
+            yield sep()
+            yield ToolButton(key_label("A", "добавить адреса"), id="l-add")
+            yield sep()
+            yield ToolButton(key_label("X", "удалить список"), id="l-del")
+            yield sep()
+            yield ToolButton(key_label("Del", "удалить адрес"), id="l-delentry")
+            yield sep()
+            yield ToolButton(key_label("?", "ещё"), id="l-help")
+            yield sep()
+            yield ToolButton(key_label("Esc", "← к правилам"), id="l-back")
+        yield StatusBar("Списки")
 
     def on_mount(self) -> None:
         lists, entries = self.query_one("#lists", DataTable), self.query_one("#entries", DataTable)
@@ -137,6 +149,7 @@ class ListsScreen(Screen):
         lists.add_column("В правилах", key="used")
         entries.add_column("Адрес", key="addr")
         lists.focus()
+        self._set_header()
         self.run_worker(self._reload())
 
     # -- data ------------------------------------------------------------
@@ -154,6 +167,25 @@ class ListsScreen(Screen):
         if self._current not in self._data:
             self._current = next(iter(self._data), None)
         self._draw_lists()
+
+    def _set_header(self) -> None:
+        if self._error:
+            note = Text.assemble(("● ", RED), ("ipset недоступен", RED))
+        elif not self._persistent:
+            note = Text.assemble(("● ", ORANGE), ("ipset-persistent", "dim"), (" не установлен", ORANGE))
+        else:
+            note = Text.assemble(("● ", GREEN), ("ipset-persistent", "dim"), " установлен")
+        self.query_one(TopBar).set_status(note)
+        self.query_one(StatusBar).set_right(f"списков: {len(self._data)}")
+
+    def _subtitles(self) -> None:
+        lists, entries = self.query_one("#lists", DataTable), self.query_one("#entries", DataTable)
+        lists.border_subtitle = f"Список {lists.cursor_row + 1} из {lists.row_count}" if lists.row_count else ""
+        entries.border_subtitle = f"Адрес {entries.cursor_row + 1} из {entries.row_count}" if entries.row_count else ""
+
+    @on(DataTable.RowHighlighted, "#entries")
+    def _entry_highlighted(self) -> None:
+        self._subtitles()
 
     def _draw_lists(self) -> None:
         table = self.query_one("#lists", DataTable)
@@ -181,6 +213,8 @@ class ListsScreen(Screen):
             table.move_cursor(row=min(row, len(entries) - 1), animate=False)
         table.border_title = f"Адреса @{self._current} ({len(entries)})" if self._current else "Адреса"
         self._draw_status()
+        self._set_header()
+        self._subtitles()
 
     def _draw_status(self) -> None:
         status = self.query_one("#lstatus", Static)
@@ -269,6 +303,10 @@ class ListsScreen(Screen):
             return
         entry = entries[table.cursor_row]
         self.run_worker(self._do(lambda _: f"Адрес {entry} удалён", lambda: self.fw.remove_from_list(name, [entry]), select=name))
+
+    @on(Button.Pressed, "#l-help")
+    def action_help(self) -> None:
+        self.app.push_screen(HelpScreen())
 
     @on(Button.Pressed, "#l-back")
     def action_back(self) -> None:

@@ -13,15 +13,11 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Checkbox, DataTable, Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
+from .chrome import Meter, StatusBar, ToolButton, TopBar, hint, hints, key_label, sep  # noqa: F401
 from .journal import MAX_ENTRIES, RETENTION_DAYS, LogEntry
-from .theme import ACTION_STYLE, BLUE, GREEN, MUTED, ORANGE, RED
+from .theme import ACTION_COLOR, ACTION_STYLE, AMBER, GREEN, MUTED, ORANGE, PINK, RED
 from .model import ACTIONS, CHAINS, PROTOCOLS, FirewallError, NewRule, Rule
 from .widgets import Segmented
-
-
-def key_label(key: str, name: str) -> Text:
-    """`F1 Добавить` with the key picked out in the accent colour."""
-    return Text.assemble((key, f"bold {BLUE}"), " " + name)
 
 
 def human_bytes(n: int) -> str:
@@ -69,8 +65,12 @@ def humanize_count(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 
 
-class ToolButton(Button, can_focus=False):
-    """Toolbar buttons never steal focus, so the arrow keys keep driving the table."""
+def dialog(title: str, *keys: Tuple[str, str], classes: str = "dialog") -> Vertical:
+    """The frame every dialog shares: the title cut into the top border, the key hints into the bottom one."""
+    box = Vertical(classes=classes)
+    box.border_title = title
+    box.border_subtitle = hints(*keys)
+    return box
 
 
 TEMPLATES = [
@@ -123,8 +123,10 @@ class AddRuleScreen(ModalScreen[Optional[NewRule]]):
 
     def compose(self) -> ComposeResult:
         init = self._initial
-        with Vertical(classes="dialog"):
-            yield Label("Редактировать правило" if self._rule else "Добавить правило", classes="title")
+        with dialog(
+            "Редактировать правило" if self._rule else "Добавить правило",
+            ("tab", "поле"), ("◄/►", "вариант"), ("⏎", "сохранить"), ("esc", "закрыть"),
+        ):
             # a rule cannot change chain in place
             yield from _choice("Chain", "chain", [(c, c) for c in CHAINS], init.chain, disabled=self._rule is not None)
             yield from _choice("Protocol", "protocol", [(p, p) for p in PROTOCOLS], init.protocol)
@@ -157,7 +159,7 @@ class AddRuleScreen(ModalScreen[Optional[NewRule]]):
                 yield Checkbox("писать срабатывания в журнал", init.log, id="log")
             yield Label("", id="error")
             with Horizontal(classes="buttons"):
-                yield Button("Сохранить", variant="success", id="save")
+                yield Button("Сохранить", id="save")
                 yield Button("Отмена", id="cancel")
 
     def on_mount(self) -> None:
@@ -232,12 +234,10 @@ class TemplateScreen(ModalScreen[Optional[NewRule]]):
 
     def compose(self) -> ComposeResult:
         width = max(len(name) for name, _ in TEMPLATES)
-        with Vertical(classes="dialog wide"):
-            yield Label("Шаблоны правил", classes="title")
+        with dialog("Шаблоны правил", ("↑↓", "выбрать"), ("⏎", "добавить"), ("esc", "закрыть"), classes="dialog wide"):
             yield OptionList(*[Option(_template_prompt(n, r, width), id=str(i)) for i, (n, r) in enumerate(TEMPLATES)])
-            yield Label("↑↓ выбрать · Enter или клик по пункту — добавить", classes="hint")
             with Horizontal(classes="buttons"):
-                yield Button("Добавить", variant="success", id="apply")
+                yield Button("Добавить", id="apply")
                 yield Button("Отмена", id="cancel")
 
     def on_mount(self) -> None:
@@ -271,8 +271,7 @@ class PickListScreen(ModalScreen[Optional[str]]):
 
     def compose(self) -> ComposeResult:
         width = max((len(n) for n in self._names), default=0)
-        with Vertical(classes="dialog"):
-            yield Label("Выберите список", classes="title")
+        with dialog("Выберите список", ("↑↓", "выбрать"), ("⏎", "выбрать"), ("esc", "закрыть")):
             if self._names:
                 yield OptionList(
                     *[
@@ -287,7 +286,7 @@ class PickListScreen(ModalScreen[Optional[str]]):
                 yield Label("Списков пока нет. Создайте их в окне «Списки» (F8).", classes="hint")
             with Horizontal(classes="buttons"):
                 if self._names:
-                    yield Button("Выбрать", variant="success", id="apply")
+                    yield Button("Выбрать", id="apply")
                 yield Button("Отмена", id="cancel")
 
     def on_mount(self) -> None:
@@ -318,11 +317,10 @@ class ConfirmScreen(ModalScreen[bool]):
         self._title = title
 
     def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog"):
-            yield Label(self._title, classes="title")
-            yield Label(self._question, classes="hint")
+        with dialog(self._title, ("◄/►", "выбор"), ("⏎", "подтвердить"), ("y/n", "да/нет"), ("esc", "закрыть"), classes="dialog confirm"):
+            yield Label(self._question, classes="question")
             with Horizontal(classes="buttons"):
-                yield Button("Удалить", variant="error", id="yes")
+                yield Button("Удалить", classes="danger", id="yes")
                 yield Button("Отмена", id="no")
 
     def on_mount(self) -> None:
@@ -335,6 +333,36 @@ class ConfirmScreen(ModalScreen[bool]):
     @on(Button.Pressed, "#no")
     def action_no(self) -> None:
         self.dismiss(False)
+
+
+HELP = (
+    ("Правила", (("F1  a", "добавить"), ("Enter  e", "изменить"), ("F2  Del  x", "удалить"), ("F3  t", "шаблон"),
+                 ("F4  u", "поднять"), ("F5  d", "опустить"), ("F6  Space", "выключить / включить"),
+                 ("F7  j", "журнал"), ("F8  l", "списки"), ("←  →", "цепочка"), ("F10  q  Esc", "выход"))),
+    ("Журнал", (("a  d  r", "accept / drop / reject"), ("←  →", "цепочка"), ("F5", "обновить снимок"),
+                ("Esc  F7", "к правилам"))),
+    ("Списки", (("N", "новый список"), ("A  Ins", "добавить адреса"), ("X", "удалить список"),
+                ("Del", "удалить адрес"), ("Tab", "другая панель"), ("Esc  F8", "к правилам"))),
+)
+
+
+class HelpScreen(ModalScreen[None]):
+    """Every key of every screen in one place."""
+
+    BINDINGS = [Binding("escape,question_mark,q", "close", "Закрыть")]
+
+    def compose(self) -> ComposeResult:
+        with dialog("Клавиши", ("esc", "закрыть"), classes="dialog wide"):
+            for title, keys in HELP:
+                yield Label(title, classes="help-title")
+                for key, what in keys:
+                    yield Label(Text.assemble((key.ljust(12), f"bold {PINK}"), what), classes="help-row")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def on_click(self) -> None:
+        self.dismiss(None)
 
 
 def rule_summary(rule: Rule) -> str:
@@ -379,6 +407,7 @@ class JournalScreen(Screen):
         Binding("a", "toggle_action('accept')", show=False),
         Binding("d", "toggle_action('drop')", show=False),
         Binding("r", "toggle_action('reject')", show=False),
+        Binding("question_mark", "help", show=False),
     ]
 
     def __init__(self, firewall) -> None:
@@ -395,19 +424,35 @@ class JournalScreen(Screen):
         self._seq = 0  # only the newest read may replace the snapshot
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="jbar"):
+        yield TopBar("linfw", "Журнал")
+        yield Meter()
+        filters = Horizontal(id="jbar")
+        filters.border_title = "Фильтры"
+        with filters:
             for chain in FILTERS:
                 yield ToolButton(chain or "Все", id=f"jf-{chain or 'ALL'}", classes="jfilter")
             yield Static("│", classes="sep")
             for action in JOURNAL_ACTIONS:
-                yield ToolButton(action, id=f"ja-{action}", classes="jaction")
-            yield Static("", classes="spacer")
-            yield ToolButton(key_label("F5", "Обновить"), id="jrefresh")
-            yield ToolButton(key_label("Esc", "← К правилам"), id="jback")
-        table = JournalTable(id="jtable", cursor_type="row", zebra_stripes=True)
+                yield ToolButton(action, id=f"ja-{action}", classes=f"jaction {action}")
+        table = JournalTable(id="jtable", cursor_type="row")
         table.cursor_foreground_priority = "renderable"
         yield table
-        yield Static("", id="jstatus")
+        status = Static("", id="jstatus")
+        status.border_title = "Состояние"
+        yield status
+        with Horizontal(id="helpbar"):
+            yield hint("↑/↓", "выбор")
+            yield sep()
+            yield hint("←/→", "цепочка")
+            yield sep()
+            yield hint("a d r", "действие")
+            yield sep()
+            yield ToolButton(key_label("F5", "обновить"), id="jrefresh")
+            yield sep()
+            yield ToolButton(key_label("?", "ещё"), id="jhelp")
+            yield sep()
+            yield ToolButton(key_label("Esc", "← к правилам"), id="jback")
+        yield StatusBar("Журнал")
 
     def on_mount(self) -> None:
         table = self.query_one("#jtable", JournalTable)
@@ -498,6 +543,7 @@ class JournalScreen(Screen):
             self._shown = shown
         status = self.query_one("#jstatus", Static)
         stamp = f"данные на {self._loaded}" if self._loaded else ""
+        self._paint_header(shown)
         if self._error:
             status.update(Text(self._error, style="bold #ff5555"))
         elif not self._snapshot:
@@ -510,6 +556,34 @@ class JournalScreen(Screen):
                 f"{self._source}  ·  записей: {count} (за {RETENTION_DAYS} дн.)  ·  {stamp}"
                 "  ·  ←→ цепочка  ·  a d r действие  ·  F5 обновить"
             )
+
+    def _paint_header(self, shown: List[LogEntry]) -> None:
+        """Bar, counts and the snapshot time: all of it describes what the filters let through."""
+        counts = {a: sum(1 for e in shown if e.action == a) for a in JOURNAL_ACTIONS}
+        left = Text()
+        for i, action in enumerate(JOURNAL_ACTIONS):
+            if i:
+                left.append("  ·  ", style=MUTED)
+            left.append(action, style=ACTION_COLOR[action])
+            left.append(f" {counts[action]}", style="bold")
+        self.query_one(Meter).show(
+            [(counts[a], ACTION_COLOR[a]) for a in JOURNAL_ACTIONS],
+            Text.assemble((str(len(shown)), "bold"), (" записей", MUTED)),
+            left,
+            Text(f"за {RETENTION_DAYS} дн., до {MAX_ENTRIES} записей", style=MUTED),
+        )
+        stamp = Text.assemble(("● ", AMBER), ("снимок, данные на ", MUTED), self._loaded) if self._loaded else Text("")
+        self.query_one(TopBar).set_status(stamp)
+        self.query_one(StatusBar).set_right(f"записей: {len(shown)}")
+        self._subtitle()
+
+    def _subtitle(self) -> None:
+        table = self.query_one("#jtable", JournalTable)
+        table.border_subtitle = f"Запись {table.cursor_row + 1} из {table.row_count}" if table.row_count else ""
+
+    @on(DataTable.RowHighlighted, "#jtable")
+    def _row_highlighted(self) -> None:
+        self._subtitle()
 
     def _refilter(self) -> None:
         self._mark_filters()
@@ -541,6 +615,10 @@ class JournalScreen(Screen):
     @on(Button.Pressed, "#jrefresh")
     def action_refresh_now(self) -> None:
         self.run_worker(self._load(), exclusive=True)
+
+    @on(Button.Pressed, "#jhelp")
+    def action_help(self) -> None:
+        self.app.push_screen(HelpScreen())
 
     @on(Button.Pressed, "#jback")
     def action_back(self) -> None:

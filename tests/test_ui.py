@@ -152,8 +152,8 @@ async def test_double_click_and_enter_open_the_editor():
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.pause()
         table = app.query_one(DataTable)  # INPUT: visible #1 ssh, #2 web
-        # header is line 0, so rows start at y=1: double click the second row
-        await pilot.click(DataTable, offset=(10, 2), times=2)
+        # the table sits in a 1-cell border and the header is line 1, so rows start at y=2: double click the second row
+        await pilot.click(DataTable, offset=(10, 3), times=2)
         await pilot.pause()
         assert isinstance(app.screen, AddRuleScreen)
         assert table.cursor_row == 1
@@ -172,7 +172,7 @@ async def test_double_click_and_enter_open_the_editor():
         await pilot.press("escape")
         await pilot.pause()
 
-        await pilot.click(DataTable, offset=(10, 0), times=2)  # header: nothing opens
+        await pilot.click(DataTable, offset=(10, 1), times=2)  # header: nothing opens
         await pilot.pause()
         assert not isinstance(app.screen, AddRuleScreen)
 
@@ -340,8 +340,8 @@ async def test_exit_button_closes_the_app():
     app, _ = make_app()
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.pause()
-        buttons = [str(b.label) for b in app.query("#toolbar Button")]
-        assert buttons[-3:] == ["F7 Журнал", "F8 Списки", "F10 Выход"]  # exit stays at the right end
+        buttons = [str(b.label) for b in app.query("#helpbar Button")]
+        assert buttons[-3:] == ["F8 списки", "? ещё", "F10 выход"]  # exit stays at the right end
         assert "F4 ▲" in buttons and "F5 ▼" in buttons  # the move buttons are arrows only
         await pilot.click("#btn-quit")
         await pilot.pause(0.5)
@@ -542,10 +542,10 @@ async def test_interface_polish_theme_tabs_empty_state_and_toolbar():
         btn = lambda i: app.query_one(f"#btn-{i}", Button)  # noqa: E731
 
         assert btn("up").disabled and not btn("down").disabled and not btn("delete").disabled  # first row selected
-        assert str(btn("toggle").label) == "F6 Выключить"
+        assert str(btn("toggle").label) == "F6 выкл"
         await pilot.press("f6")
         await pilot.pause(0.5)
-        assert str(btn("toggle").label) == "F6 Включить"  # it says what it will do next
+        assert str(btn("toggle").label) == "F6 вкл"  # it says what it will do next
         await pilot.press("down", "down", "down", "down", "down")  # to the last of six rows
         await pilot.pause()
         assert btn("down").disabled and not btn("up").disabled  # last row
@@ -562,3 +562,77 @@ async def test_interface_polish_theme_tabs_empty_state_and_toolbar():
         await pilot.press("right")  # chain switching still works without a table to focus
         await pilot.pause(0.4)
         assert app.query_one("#rules").display and not app.query_one("#empty").display
+
+
+async def test_deep_blue_look_header_meter_panels_and_dialog_frames():
+    from textual.widgets import Static
+
+    from linfw.chrome import Meter, StatusBar, TopBar
+    from linfw.screens import HelpScreen
+
+    app, _ = make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.5)
+        crumb = str(app.query_one("#crumb", Static).render())
+        assert crumb.split() == ["iptables", "›", "INPUT"]
+        await pilot.press("right")
+        await pilot.pause(0.3)
+        assert str(app.query_one("#crumb", Static).render()).split()[-1] == "OUTPUT"
+        await pilot.press("left")
+        await pilot.pause(0.3)
+
+        # the two panels under the meter describe the chain and split its packets between the actions
+        chain = str(app.query_one("#stat-chain", Static).render())
+        assert "правил" in chain and "политика" in chain and "accept" in chain
+        packets = str(app.query_one("#stat-packets", Static).render())
+        assert all(word in packets for word in ("accept", "drop", "reject", "всего"))
+        assert "отклонено" in str(app.query_one("#stat-packets").border_title)
+        assert "Правило 1 из 6" in str(app.query_one("#rules").border_subtitle)
+        assert "правил: 10" in str(app.query_one("#sb-right", Static).render())
+        assert app.query_one(Meter).display and app.query_one(TopBar) and app.query_one(StatusBar)
+
+        # dialogs carry their title and key hints in the border
+        await pilot.press("f1")
+        await pilot.pause()
+        frame = app.screen.query_one(".dialog")
+        assert str(frame.border_title) == "Добавить правило" and "сохранить" in str(frame.border_subtitle)
+        await pilot.press("escape")
+        await pilot.pause()
+
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert isinstance(app.screen, HelpScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, HelpScreen)
+
+
+async def test_short_terminal_hides_the_meter_and_panels():
+    app, _ = make_app()
+    async with app.run_test(size=(120, 26)) as pilot:
+        await pilot.pause(0.5)
+        assert not app.query_one("#stats").display and not app.query_one("#meter").display
+        assert app.query_one("#rules").region.height >= 6
+
+
+async def test_journal_and_lists_have_the_same_frame():
+    from textual.widgets import Static
+
+    from linfw.chrome import Meter
+
+    app, _ = make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.4)
+        await pilot.press("j")
+        await pilot.pause(0.6)
+        assert str(app.screen.query_one("#crumb", Static).render()).split() == ["linfw", "›", "Журнал"]
+        assert "снимок" in str(app.screen.query_one("#live", Static).render())
+        assert "Запись 1 из" in str(app.screen.query_one("#jtable").border_subtitle)
+        assert app.screen.query_one(Meter)
+        await pilot.press("escape")
+        await pilot.pause(0.3)
+        await pilot.press("l")
+        await pilot.pause(0.6)
+        assert str(app.screen.query_one("#crumb", Static).render()).split() == ["linfw", "›", "Списки"]
+        assert "Список 1 из 2" in str(app.screen.query_one("#lists").border_subtitle)
+        assert "списков: 2" in str(app.screen.query_one("#sb-right", Static).render())
