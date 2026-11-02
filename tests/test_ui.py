@@ -636,3 +636,53 @@ async def test_journal_and_lists_have_the_same_frame():
         assert str(app.screen.query_one("#crumb", Static).render()).split() == ["linfw", "›", "Списки"]
         assert "Список 1 из 2" in str(app.screen.query_one("#lists").border_subtitle)
         assert "списков: 2" in str(app.screen.query_one("#sb-right", Static).render())
+
+
+async def test_journal_exact_filter_and_reset():
+    from linfw.journal import LogEntry
+
+    app, runner = make_app()
+    row = lambda n, chain, proto, src, dst, port: LogEntry(  # noqa: E731
+        f"2026-10-28 10:00:{n:02d}", chain, "drop", proto, src, dst, port)
+    runner._hits = [
+        row(1, "INPUT", "tcp", "203.0.113.5", "192.168.1.10", "22"),
+        row(2, "INPUT", "udp", "203.0.113.9", "192.168.1.10", "53"),
+        row(3, "INPUT", "tcp", "198.51.100.7", "192.168.1.10", "22"),
+        row(4, "OUTPUT", "tcp", "192.168.1.10", "8.8.8.8", "443"),
+    ]
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause(0.4)
+        await pilot.press("j")
+        await pilot.pause(0.6)
+        screen = app.screen
+        table = screen.query_one("#jtable", DataTable)
+        assert table.row_count == 4
+        widths = [c.width for c in table.columns.values()]
+        assert sum(widths) + 2 * table.cell_padding * len(widths) == table.scrollable_content_region.width  # the whole width
+
+        # letters typed into a field are text, not the a/d/r action shortcuts
+        await pilot.click("#jfind-source")
+        await pilot.press("2", "0", "3", ".", "0", ".", "1", "1", "3", ".", "0", "/", "2", "4")
+        await pilot.press("a", "d", "r")
+        assert screen.actions == set() and table.row_count == 4  # nothing applied before Enter
+        screen.query_one("#jfind-source", Input).value = "203.0.113.0/24"
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        assert table.row_count == 2  # a network matches every address in it
+        assert screen.query_one("#jtable").has_focus
+
+        await pilot.click("#jfind-protocol")
+        screen.query_one("#jfind-protocol", Input).value = "TCP"
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        assert table.row_count == 1 and str(table.get_row_at(0)[3]) == "203.0.113.5"  # fields work together
+
+        await pilot.click("#jfind-port")
+        screen.query_one("#jfind-port", Input).value = "53"
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        assert table.row_count == 0  # tcp + 53 + that network: nothing
+
+        await pilot.click("#jreset")
+        await pilot.pause(0.3)
+        assert table.row_count == 4 and all(screen.query_one(f"#jfind-{k}", Input).value == "" for k in ("protocol", "source", "destination", "port"))

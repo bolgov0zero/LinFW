@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -13,7 +14,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Checkbox, DataTable, Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
-from .chrome import Meter, StatusBar, ToolButton, TopBar, hint, hints, key_label, sep  # noqa: F401
+from .chrome import Meter, StatusBar, ToolButton, TopBar, hint, hints, key_label, sep, stretch_columns  # noqa: F401
 from .journal import MAX_ENTRIES, RETENTION_DAYS, LogEntry
 from .theme import ACTION_COLOR, ACTION_STYLE, AMBER, GREEN, MUTED, ORANGE, PINK, RED
 from .model import ACTIONS, CHAINS, PROTOCOLS, FirewallError, NewRule, Rule
@@ -383,11 +384,38 @@ COLUMNS = ("time", "chain", "protocol", "source", "destination", "port", "action
 SNAPSHOT_LIMIT = 50_000  # records loaded at once; the filters then work on this snapshot
 
 
+JOURNAL_SPREAD = (1, 1, 1, 3, 3, 1, 1)  # how the free width of the table is shared between the columns
+FIND_FIELDS = (("protocol", "protocol"), ("source", "source"), ("destination", "destination"), ("port", "port"))
+
+
+def _matches_address(entry_value: str, wanted: str) -> bool:
+    """`10.0.0.5` matches itself, a network (`10.0.0.0/24`) matches every address in it,
+    anything else (a part of an address) matches by occurrence."""
+    wanted = wanted.strip()
+    try:
+        network = ipaddress.ip_network(wanted, strict=False)
+        return ipaddress.ip_address(entry_value) in network
+    except ValueError:
+        return wanted in entry_value
+
+
+def matches_find(entry: LogEntry, find: Dict[str, str]) -> bool:
+    """The exact filter: every field that is filled in must match (empty fields are ignored)."""
+    if find["protocol"] and entry.protocol != find["protocol"].strip().lower():
+        return False
+    if find["port"] and entry.port != find["port"].strip():
+        return False
+    return all(not find[k] or _matches_address(getattr(entry, k), find[k]) for k in ("source", "destination"))
+
+
 class JournalTable(DataTable):
     BINDINGS = [
         Binding("left", "screen.prev_filter", show=False),
         Binding("right", "screen.next_filter", show=False),
     ]
+
+    def on_resize(self) -> None:
+        self.screen.fit_columns()
 
 
 class JournalScreen(Screen):
@@ -414,6 +442,7 @@ class JournalScreen(Screen):
         super().__init__()
         self.fw = firewall
         self.filter: Optional[str] = None
+        self.find: Dict[str, str] = {key: "" for key, _ in FIND_FIELDS}  # the exact filter, set by Enter
         self.actions: Set[str] = set()
         self._snapshot: List[LogEntry] = []  # oldest first, as read
         self._source = ""
@@ -434,6 +463,12 @@ class JournalScreen(Screen):
             yield Static("│", classes="sep")
             for action in JOURNAL_ACTIONS:
                 yield ToolButton(action, id=f"ja-{action}", classes=f"jaction {action}")
+        fields = Horizontal(id="jfields")
+        fields.border_title = "Точный фильтр"
+        with fields:
+            for key, placeholder in FIND_FIELDS:
+                yield Input(placeholder=placeholder, id=f"jfind-{key}", classes="jfind")
+            yield ToolButton("Сбросить", id="jreset")
         table = JournalTable(id="jtable", cursor_type="row")
         table.cursor_foreground_priority = "renderable"
         yield table
@@ -514,7 +549,9 @@ class JournalScreen(Screen):
         wanted = [
             e
             for e in reversed(self._snapshot)
-            if self.filter in (None, e.chain) and (not self.actions or e.action in self.actions)
+            if self.filter in (None, e.chain)
+            and (not self.actions or e.action in self.actions)
+            and matches_find(e, self.find)
         ]
         return wanted[:MAX_ENTRIES]
 
@@ -539,6 +576,7 @@ class JournalScreen(Screen):
                 table.move_cursor(row=0, animate=False)
             table.scroll_y = 0
             self._shown = shown
+            self.fit_columns()
         status = self.query_one("#jstatus", Static)
         stamp = f"данные на {self._loaded}" if self._loaded else ""
         self._paint_header(shown)
@@ -582,6 +620,29 @@ class JournalScreen(Screen):
     @on(DataTable.RowHighlighted, "#jtable")
     def _row_highlighted(self) -> None:
         self._subtitle()
+
+    def fit_columns(self) -> None:
+        """Stretch the columns over the whole width of the table."""
+        need = [len(name) for name in COLUMNS]
+        for e in self._shown or []:
+            for i, value in enumerate((e.time, e.chain, e.protocol, e.source, e.destination, e.port, e.action)):
+                need[i] = max(need[i], len(value))
+        stretch_columns(self.query_one("#jtable", JournalTable), need, JOURNAL_SPREAD)
+
+    @on(Input.Submitted, ".jfind")
+    def _find_submitted(self) -> None:
+        """Enter in any of the four fields applies all of them together."""
+        self.find = {key: self.query_one(f"#jfind-{key}", Input).value.strip() for key, _ in FIND_FIELDS}
+        self._refilter()
+        self.query_one("#jtable", JournalTable).focus()
+
+    @on(Button.Pressed, "#jreset")
+    def _find_reset(self) -> None:
+        for key, _ in FIND_FIELDS:
+            self.query_one(f"#jfind-{key}", Input).value = ""
+        self.find = {key: "" for key, _ in FIND_FIELDS}
+        self._refilter()
+        self.query_one("#jtable", JournalTable).focus()
 
     def _refilter(self) -> None:
         self._mark_filters()

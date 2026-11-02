@@ -10,7 +10,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import Button, DataTable, Static, Tab, Tabs
 
-from .chrome import StatusBar, ToolButton, TopBar, fit_title, key_label, row, sep
+from .chrome import StatusBar, ToolButton, TopBar, fit_title, key_label, row, sep, stretch_columns
 from .firewall import Firewall
 from .model import CHAINS, FirewallError, NewRule, Rule
 from .parser import Snapshot
@@ -169,6 +169,13 @@ class LinFWApp(App):
 
     /* journal and lists */
     #jbar { height: 3; padding: 0 1; border-title-color: $text; border-title-style: bold; }
+    #jfields { height: 3; padding: 0 1; border: round $line; border-title-color: $text; border-title-style: bold; }
+    #jfields Input { height: 1; border: none; border-left: tall $line; padding: 0 1; margin-right: 1; background: $primary 8%; }
+    #jfields Input:focus { border-left: tall $pink; background: $primary 22%; }
+    #jfields #jfind-protocol, #jfields #jfind-port { width: 14; }
+    #jfields #jfind-source, #jfields #jfind-destination { width: 1fr; }
+    #jfields Button { min-width: 0; height: 1; border: none; padding: 0 2; margin: 0; background: transparent; color: $dim; }
+    #jfields Button:hover { background: $pink 25%; color: $text; }
     #jbar Button, #helpbar Button.jaction { min-width: 0; height: 1; border: none; padding: 0 1; margin: 0 0 0 0; background: transparent; color: $dim; }
     #jbar Button:hover { background: $primary 20%; color: $text; }
     #jbar .sep { width: 1; color: $faint; margin: 0 1; }
@@ -416,24 +423,11 @@ class LinFWApp(App):
     def fit_columns(self) -> None:
         """Stretch the columns over the whole width of the table: every column keeps what its
         widest cell needs and the free space is shared out (more to addresses, none to «#»)."""
-        table = self.table
-        width = table.scrollable_content_region.width
-        if width <= 0:
-            return
         need = [len(name) for name in COLUMNS]
         for rule in self._shown or []:
             for i, cell in enumerate(row_cells(rule, self._pkts(rule))):
                 need[i] = max(need[i], cell.cell_len)
-        free = max(width - sum(need) - 2 * table.cell_padding * len(COLUMNS), 0)
-        weights = sum(SPREAD)
-        given = 0
-        for i, (name, column) in enumerate(zip(COLUMNS, table.columns.values())):
-            share = free * SPREAD[i] // weights if i < len(COLUMNS) - 1 else free - given
-            given += share
-            column.auto_width = False
-            column.width = need[i] + share
-        table._require_update_dimensions = True
-        table.refresh(layout=True)
+        stretch_columns(self.table, need, SPREAD)
 
     def _selected_rule(self) -> Optional[Rule]:
         table = self.table

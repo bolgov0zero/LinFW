@@ -47,6 +47,24 @@ def sep() -> Static:
     return Static("·", classes="sep")
 
 
+def stretch_columns(table, need: Sequence[int], spread: Sequence[int]) -> None:
+    """Stretch the columns of a DataTable over its whole width: each keeps `need` cells (what its
+    widest cell takes) and the free width is shared out by `spread` (0 = the column does not grow)."""
+    width = table.scrollable_content_region.width
+    columns = list(table.columns.values())
+    if width <= 0 or len(columns) != len(need):
+        return
+    free = max(width - sum(need) - 2 * table.cell_padding * len(need), 0)
+    given = 0
+    for i, column in enumerate(columns):
+        share = free * spread[i] // sum(spread) if i < len(need) - 1 else free - given
+        given += share
+        column.auto_width = False
+        column.width = need[i] + share
+    table._require_update_dimensions = True
+    table.refresh(layout=True)
+
+
 def row(label: Text, value: Text, width: int) -> Text:
     """`label ........ value`, the value flush right."""
     out = Text(no_wrap=True, overflow="ellipsis")
