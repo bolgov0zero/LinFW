@@ -1,22 +1,20 @@
-"""Make iptables rules survive a reboot.
+"""Make the rules survive a reboot.
 
-Every distro restores them differently, so we detect what is installed:
-  * Debian/Ubuntu  - netfilter-persistent (package iptables-persistent)
-  * RHEL/Fedora    - /etc/sysconfig/iptables (package iptables-services)
-  * Arch           - /etc/iptables/iptables.rules (iptables.service)
-  * Alpine         - /etc/init.d/iptables save
-install.sh installs and enables the matching package.
+LinFW keeps its table in one file, /etc/linfw/linfw.nft, that `nft -f` loads in one step
+(it replaces the whole table, sets included, so rules never come up without their lists).
+The systemd unit linfw.service, written by install.sh, loads it early in the boot.
 """
 from __future__ import annotations
 
 import os
 import shutil
-import subprocess
-from typing import Callable, Optional, Tuple
+from typing import Optional
 
 from .model import FirewallError
 
 _SBIN = ("/usr/sbin", "/sbin", "/usr/local/sbin")
+RULES_FILE = "/etc/linfw/linfw.nft"
+UNIT_FILE = "/etc/systemd/system/linfw.service"
 
 
 def find_binary(name: str) -> Optional[str]:
@@ -30,47 +28,25 @@ def find_binary(name: str) -> Optional[str]:
     return None
 
 
-def _write_dump(path: str, dump: str) -> None:
-    tmp = path + ".linfw-tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(dump)
-    os.replace(tmp, path)
-
-
-def _method() -> Optional[Tuple[str, Callable[[str], None]]]:
-    nfp = find_binary("netfilter-persistent")
-    if nfp:
-        def save_nfp(_dump: str) -> None:
-            r = subprocess.run([nfp, "save"], capture_output=True, text=True, timeout=30)
-            if r.returncode:
-                raise FirewallError((r.stderr or r.stdout).strip() or "netfilter-persistent save failed")
-        return "netfilter-persistent", save_nfp
-
-    rhel_service = os.path.exists("/usr/lib/systemd/system/iptables.service")
-    for path in ("/etc/sysconfig/iptables", "/etc/iptables/iptables.rules", "/etc/iptables/rules-save"):
-        if os.path.exists(path) or (path == "/etc/sysconfig/iptables" and rhel_service):
-            return path, lambda dump, p=path: _write_dump(p, dump)
-    return None
-
-
 def describe() -> Optional[str]:
     """Name of the persistence mechanism, or None if nothing is configured."""
-    m = _method()
-    return m[0] if m else None
+    return "linfw.nft" if os.path.exists(UNIT_FILE) else None
 
 
-def save(dump: str) -> str:
-    """Persist the full `iptables-save` dump; returns a short status message."""
-    m = _method()
-    if not m:
+def save(text: str, path: str = RULES_FILE) -> str:
+    """Write the table file (atomically); returns a short status message."""
+    if not describe():
         raise FirewallError(
             "Автосохранение не настроено: после перезагрузки правила пропадут. "
             "Запустите install.sh ещё раз."
         )
-    label, writer = m
+    tmp = path + ".linfw-tmp"
     try:
-        writer(dump)
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
     except OSError as exc:
         raise FirewallError(f"Не удалось сохранить правила: {exc}") from None
-    return label
+    return describe() or ""

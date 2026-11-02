@@ -1,87 +1,88 @@
 from __future__ import annotations
 
 import ipaddress
-import shlex
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from .lists import list_ref, set_name
+from .lists import list_ref
 
 CHAINS = ("INPUT", "OUTPUT", "FORWARD")
 PROTOCOLS = ("all", "tcp", "udp", "icmp")
 ACTIONS = ("ACCEPT", "DROP", "REJECT")
 
-# iptables has no native "disabled" flag. A disabled rule keeps all its matches
-# but jumps to an empty user chain, which is a no-op: the packet returns and is
-# evaluated against the next rule. One chain per action remembers the original.
-OFF_PREFIX = "LINFW_OFF_"
-OFF_CHAINS = tuple(OFF_PREFIX + a for a in ACTIONS) + (OFF_PREFIX + "LOG",)
+# LinFW owns one nftables table and never touches the others (docker, fail2ban ...).
+FAMILY = "ip"
+TABLE = "linfw"
+SET_TYPE = "type ipv4_addr; flags interval;"
 
-# Logging: a rule with "write to the journal" is preceded by a hidden twin rule
-# with the same matches whose target is NFLOG (non-terminating: the packet goes on
-# to the real rule). NFLOG hands the packet to userspace over netlink, where the
-# linfw-logd service records it; unlike LOG it does not depend on the kernel ring
-# buffer, which containers cannot read. The twin is rate-limited so a busy rule
-# cannot flood the journal.
+# Every rule carries its role in an nft comment: that is how a rule is recognised again.
+#   linfw:rule              an ordinary rule
+#   linfw:off:<action>[:log]  a rule switched off: it keeps all its matches but its verdict
+#                           is `continue`, so the packet goes on to the next rule; the comment
+#                           remembers what the verdict was (and whether logging was on)
+#   linfw:log               the hidden twin that logs a packet before the rule below it decides
+#   linfw:base:<id>         a base rule (loopback, established/related)
+RULE_TAG = "linfw:rule"
+OFF_TAG = "linfw:off"
 LOG_TAG = "linfw:log"
+BASE_TAG = "linfw:base"
+
+# Logging: a rule with "write to the journal" is preceded by a hidden twin with the same
+# matches whose statements are `limit` + `log group`. The twin has no verdict, so the packet
+# goes on to the real rule. The log statement hands the packet to NFLOG (netlink), where the
+# linfw-logd service records it; the limit keeps a busy rule from flooding the journal.
 LOG_PREFIX = "LINFW"  # the packet prefix is "LINFW:<CHAIN>:<ACTION>: "
 LOG_GROUP = 40  # nflog group shared by the twin rules and linfw-logd
-LOG_RATE = "10/min"
+LOG_RATE = "10/minute"
 LOG_BURST = "10"
-LOG_TARGETS = ("LOG", "NFLOG")  # LOG is what earlier versions installed
 
-
-# Base rules: always on top of the chain, never shown in the table and never
-# editable. Every one of them carries a comment "linfw:base:<id>" that is how
-# we recognise (and restore) them.
-BASE_TAG = "linfw:base"
-_ESTABLISHED = ["-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED"]
+# Base rules: always on top of the chain, never shown in the table and never editable.
 BASE_RULES = {
-    "INPUT": [("lo", ["-i", "lo"]), ("est", _ESTABLISHED)],
-    "OUTPUT": [("lo", ["-o", "lo"]), ("est", _ESTABLISHED)],
-    "FORWARD": [("est", _ESTABLISHED)],
+    "INPUT": [("lo", ["iifname", '"lo"', "accept"]), ("est", ["ct", "state", "established,related", "accept"])],
+    "OUTPUT": [("lo", ["oifname", '"lo"', "accept"]), ("est", ["ct", "state", "established,related", "accept"])],
+    "FORWARD": [("est", ["ct", "state", "established,related", "accept"])],
 }
 
 
 def log_prefix(chain: str, action: str) -> str:
-    return f"{LOG_PREFIX}:{chain}:{action}: "
+    return f"{LOG_PREFIX}:{chain}:{action.upper()}: "
 
 
-def nflog_target(chain: str, action: str, prefix: Optional[str] = None) -> List[str]:
-    return ["-j", "NFLOG", "--nflog-group", str(LOG_GROUP), "--nflog-prefix", prefix or log_prefix(chain, action)]
+def log_tokens(chain: str, action: str) -> List[str]:
+    """The statements of a log twin, after its matches."""
+    return ["limit", "rate", LOG_RATE, "burst", LOG_BURST, "packets", "log", "prefix", f'"{log_prefix(chain, action)}"', "group", str(LOG_GROUP)]
 
 
 def base_ids(chain: str) -> List[str]:
     return [f"{BASE_TAG}:{name}" for name, _ in BASE_RULES[chain]]
 
 
-def base_specs(chain: str) -> List[List[str]]:
-    return [
-        [*match, "-m", "comment", "--comment", f"{BASE_TAG}:{name}", "-j", "ACCEPT"]
-        for name, match in BASE_RULES[chain]
-    ]
+def base_spec(chain: str, tag: str) -> List[str]:
+    name = tag[len(BASE_TAG) + 1:]
+    return list(next(spec for n, spec in BASE_RULES[chain] if n == name))
 
 
 class FirewallError(Exception):
-    """A user-presentable failure while talking to iptables."""
+    """A user-presentable failure while talking to nftables."""
 
 
 @dataclass(frozen=True)
 class Rule:
     chain: str
-    index: int  # 1-based position inside the chain, as iptables counts it
+    index: int  # 1-based position inside the chain, hidden rules included
     pkts: int
     bytes: int
     protocol: str
     source: str
     destination: str
     port: str
-    action: str  # lower-case target; for disabled rules, the original action
+    action: str  # lower-case verdict; for disabled rules, the original action
     enabled: bool
-    spec: Tuple[str, ...]  # tokens after "-A CHAIN", used to re-issue the rule
+    spec: Tuple[str, ...]  # the rule as nft words, as if it were switched on (counter and comment left out)
     extra: Tuple[str, ...] = ()  # matches that have no column of their own
     number: int = 0  # position shown to the user: hidden rules are not counted
-    log: bool = False  # a hidden log twin sits right above this rule
+    log: bool = False  # logging is on: a hidden twin sits right above this rule (or, if off, the comment says so)
+    tag: str = ""  # the rule's nft comment (see RULE_TAG ...)
 
     @property
     def key(self) -> str:
@@ -89,17 +90,12 @@ class Rule:
 
     @property
     def base_id(self) -> Optional[str]:
-        for i, tok in enumerate(self.spec[:-1]):
-            if tok == "--comment" and self.spec[i + 1].startswith(BASE_TAG + ":"):
-                return self.spec[i + 1]
-        return None
+        return self.tag if self.tag.startswith(BASE_TAG + ":") else None
 
     @property
     def is_log(self) -> bool:
-        """True for the hidden LOG twin of the rule below it."""
-        return any(
-            tok == "--comment" and self.spec[i + 1] == LOG_TAG for i, tok in enumerate(self.spec[:-1])
-        )
+        """True for the hidden log twin of the rule below it."""
+        return self.tag == LOG_TAG
 
     @property
     def hidden(self) -> bool:
@@ -123,7 +119,9 @@ class Rule:
         )
 
     def describe(self) -> str:
-        return shlex.join(["-A", self.chain, *self.spec])
+        """The rule as nft would take it, for copying."""
+        words = list(self.spec) if self.enabled else [*self.spec[:-1], "continue"]
+        return f"nft add rule {FAMILY} {TABLE} {self.chain.lower()} {' '.join(words)}"
 
 
 @dataclass
@@ -160,31 +158,26 @@ class NewRule:
     def used_lists(self) -> List[str]:
         return [n for n in (list_ref(self.source), list_ref(self.destination)) if n]
 
-    def to_spec(self) -> List[str]:
+    def match_spec(self) -> List[str]:
+        """The matches of the rule in nft words (the same words a listing of the rule gives back)."""
         spec: List[str] = []
-        if self.protocol != "all":
-            spec += ["-p", self.protocol]
-        for flag, value, direction in (("-s", self.source, "src"), ("-d", self.destination, "dst")):
-            name = list_ref(value) if value else None
-            if name:
-                spec += ["-m", "set", "--match-set", set_name(name), direction]
-            elif value:
-                spec += [flag, value]
-        if self.port:
-            if "," in self.port:
-                spec += ["-m", "multiport", "--dports", self.port]
-            else:
-                spec += ["--dport", self.port]
-        return spec + ["-j", self.action]
+        port = self.port.replace(":", "-")
+        if port:
+            spec += [self.protocol, "dport", "{" + port + "}" if "," in port else port]
+        elif self.protocol != "all":
+            spec += ["ip", "protocol", self.protocol]
+        if self.source:
+            spec += ["ip", "saddr", self.source]
+        if self.destination:
+            spec += ["ip", "daddr", self.destination]
+        return spec
 
-    def to_log_spec(self, enabled: bool = True) -> List[str]:
-        """The hidden twin: same matches, then LOG (or, while the rule is switched
-        off, a jump to the empty LINFW_OFF_LOG chain)."""
-        spec = self.to_spec()[:-2] + ["-m", "comment", "--comment", LOG_TAG]
-        spec += ["-m", "limit", "--limit", LOG_RATE, "--limit-burst", LOG_BURST]
-        if enabled:
-            return spec + nflog_target(self.chain, self.action)
-        return spec + ["-j", OFF_PREFIX + "LOG"]
+    def to_spec(self) -> List[str]:
+        return self.match_spec() + [self.action.lower()]
+
+    def to_log_spec(self) -> List[str]:
+        """The hidden twin: the same matches, then limit + log (no verdict)."""
+        return self.match_spec() + log_tokens(self.chain, self.action)
 
 
 def _normalize_address(value: str, label: str) -> str:

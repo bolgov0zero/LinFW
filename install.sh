@@ -6,8 +6,9 @@
 #   ./install.sh --uninstall
 #
 # Installs LinFW into a private virtualenv (/opt/linfw), links /usr/local/bin/linfw,
-# sets up the distro's way of restoring iptables rules after a reboot, applies the
-# base rules and installs the linfw-logd service (journal and persistent counters).
+# installs nftables and the linfw.service unit that loads LinFW's own table at boot
+# (/etc/linfw/linfw.nft), applies the base rules and installs the linfw-logd service
+# (journal and persistent counters). Other nftables tables are never touched.
 #
 # The screen is cleared and only the steps are shown, each with a spinner and then a
 # check mark. Everything the tools print goes to a log file, which is shown (its tail)
@@ -19,6 +20,8 @@ REF="${LINFW_REF:-main}"
 PREFIX="${LINFW_PREFIX:-/opt/linfw}"
 LINK="/usr/local/bin/linfw"
 UNIT="/etc/systemd/system/linfw-logd.service"
+BOOT_UNIT="/etc/systemd/system/linfw.service"
+RULES_FILE="/etc/linfw/linfw.nft"
 
 # --- screen -------------------------------------------------------------------
 
@@ -45,7 +48,7 @@ ui_start() {
   if [ "$TTY" = 1 ]; then
     printf '\033[2J\033[H\033[?25l'   # clear the screen, hide the cursor
   fi
-  printf '\n  %sLinFW%s  %s·  управление iptables в терминале%s\n' "$C_BOLD$C_ACC" "$C_OFF" "$C_DIM" "$C_OFF"
+  printf '\n  %sLinFW%s  %s·  управление nftables в терминале%s\n' "$C_BOLD$C_ACC" "$C_OFF" "$C_DIM" "$C_OFF"
   printf '  %s%s%s\n\n' "$C_DIM" "$RULE" "$C_OFF"
 }
 
@@ -136,36 +139,24 @@ step_system() {
   if ! name="$(supported_os)"; then
     abort "LinFW поддерживает только Debian и Ubuntu (и их производные)." \
           "Ваша система: $name." \
-          "Нужны пакеты iptables-persistent и ipset-persistent: на других дистрибутивах" \
-          "правила и адресные списки не переживут перезагрузку."
+          "Установщик ставит пакеты через apt, а загрузку правил настраивает через systemd."
   fi
   command -v apt-get > /dev/null || abort "Не найден apt-get: установка возможна только на системах с apt."
+  [ -d /run/systemd/system ] || warn_note "нет systemd: правила не будут загружаться при старте системы"
   note "$name"
 }
 
-# python3 + venv, iptables, and what restores rules and address lists at boot
+# python3 + venv and nftables (LinFW works with its own table, so the other tables stay as they are)
 step_packages() {
   export DEBIAN_FRONTEND=noninteractive
-  # answer iptables-persistent's "save current rules?" questions
-  if command -v debconf-set-selections > /dev/null; then
-    echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
-    echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
-  fi
   apt-get update -qq
-  apt-get install -y -qq python3 python3-venv iptables iptables-persistent netfilter-persistent
+  apt-get install -y -qq python3 python3-venv nftables
   python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || { echo "Нужен Python 3.9 или новее" >&2; exit 1; }
-  # address lists are ipset sets; ipset-persistent restores them before the rules at boot
-  if apt-get install -y -qq ipset ipset-persistent; then
-    if ipset create -exist linfw_probe hash:net && ipset destroy linfw_probe; then
-      note "iptables-persistent, ipset-persistent"
-    else
-      warn_note "ipset недоступен в ядре: адресные списки не будут работать (в контейнере: modprobe ip_set ip_set_hash_net на хосте)"
-    fi
-  else
-    warn_note "не удалось поставить ipset-persistent: адресные списки не переживут перезагрузку"
+  if ! nft list tables > /dev/null 2>&1; then
+    abort "nftables недоступен в ядре (nft list tables не работает)." \
+          "В контейнере модуль nf_tables должен быть доступен с хоста."
   fi
-  printf '%s' "netfilter-persistent" > "$STATE/persist"
-  return 0
+  note "$(nft --version)"
 }
 
 step_linfw() {
@@ -179,7 +170,39 @@ step_linfw() {
   note "$("$PREFIX/bin/linfw" --version)"
 }
 
-# loopback + established/related on top of every chain, hidden in the UI
+# the unit that loads /etc/linfw/linfw.nft (LinFW's table with its address lists) early in the boot
+step_boot() {
+  local nft_bin
+  nft_bin="$(command -v nft)"
+  mkdir -p "$(dirname "$RULES_FILE")"
+  if [ -d /run/systemd/system ] && command -v systemctl > /dev/null; then
+    cat > "$BOOT_UNIT" << UNITFILE
+[Unit]
+Description=LinFW: load the firewall table (nftables)
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+ConditionPathExists=$RULES_FILE
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$nft_bin -f $RULES_FILE
+ExecReload=$nft_bin -f $RULES_FILE
+
+[Install]
+WantedBy=sysinit.target
+UNITFILE
+    systemctl daemon-reload
+    systemctl enable linfw.service || warn_note "не удалось включить linfw.service"
+    note "linfw.service, $RULES_FILE"
+  else
+    warn_note "нет systemd: после перезагрузки правила не загрузятся сами (nft -f $RULES_FILE)"
+  fi
+}
+
+# the table, and loopback + established/related on top of every chain, hidden in the UI
 step_base_rules() {
   if "$PREFIX/bin/linfw" --apply-base; then
     note "loopback, established/related"
@@ -188,14 +211,14 @@ step_base_rules() {
   fi
 }
 
-# linfw-logd records packets of rules with logging on (iptables NFLOG) and samples the counters
+# linfw-logd records packets of rules with logging on (nftables log group) and samples the counters
 step_service() {
   if [ -d /run/systemd/system ] && command -v systemctl > /dev/null; then
     cat > "$UNIT" << UNITFILE
 [Unit]
 Description=LinFW background service: rule hit journal and persistent counters
 # started after the firewall is restored, stopped before it is torn down, so the last counters are saved
-After=network.target netfilter-persistent.service iptables.service
+After=network.target linfw.service
 
 [Service]
 ExecStart=$PREFIX/bin/linfw --logd
@@ -281,23 +304,22 @@ main() {
     run_step "Удаление базовых правил" step_remove_rules
     run_step "Остановка службы журнала" step_remove_service
     run_step "Удаление файлов" step_remove_files
-    printf '\n  %s%s%s %sLinFW удалён.%s Сохранённые правила iptables и пакеты автозагрузки не тронуты.\n\n' \
-      "$C_OK" "$M_OK" "$C_OFF" "$C_BOLD" "$C_OFF"
+    printf '\n  %s%s%s %sLinFW удалён.%s Таблица linfw, файл %s и служба linfw.service не тронуты\n  %s(убрать совсем: nft delete table ip linfw; systemctl disable linfw; rm -r /etc/linfw).%s\n\n' \
+      "$C_OK" "$M_OK" "$C_OFF" "$C_BOLD" "$C_OFF" "$RULES_FILE" "$C_DIM" "$C_OFF"
     return 0
   fi
 
-  TOTAL=5
+  TOTAL=6
   run_step "Проверка системы" step_system
   run_step "Установка зависимостей" step_packages
   run_step "Установка LinFW" step_linfw
-  run_step "Базовые правила" step_base_rules
+  run_step "Автозагрузка правил" step_boot
+  run_step "Таблица и базовые правила" step_base_rules
   run_step "Служба журнала" step_service
 
-  local persist=""
-  [ -s "$STATE/persist" ] && persist="$(cat "$STATE/persist")"
   printf '\n  %s%s%s %sГотово.%s Запуск:  %slinfw%s\n' "$C_OK" "$M_OK" "$C_OFF" "$C_BOLD" "$C_OFF" "$C_ACC" "$C_OFF"
-  if [ -n "$persist" ]; then
-    printf '    %sПравила сохраняются автоматически (%s).%s\n\n' "$C_DIM" "$persist" "$C_OFF"
+  if [ -f "$BOOT_UNIT" ]; then
+    printf '    %sПравила сохраняются автоматически (%s).%s\n\n' "$C_DIM" "$RULES_FILE" "$C_OFF"
   else
     printf '    %s%s Автосохранение правил не настроено: после перезагрузки они пропадут.%s\n\n' "$C_WARN" "$M_WARN" "$C_OFF"
   fi

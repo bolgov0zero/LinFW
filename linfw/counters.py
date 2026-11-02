@@ -1,6 +1,6 @@
 """Packet/byte counters that survive resets.
 
-iptables keeps its counters in the kernel, and they start from zero after a
+nftables keeps its counters in the kernel, and they start from zero after a
 reboot (the saved rules carry no counters), after a rule is replaced, or when
 another tool reloads the rules. LinFW therefore keeps its own running totals.
 
@@ -16,18 +16,17 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import threading
 import time
 from contextlib import contextmanager
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, Optional, Tuple
 
 try:  # not available on every platform; the store then works without cross-process locking
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None
 
-from .model import OFF_PREFIX, Rule
+from .model import Rule
 from .parser import Snapshot
 
 COUNTERS_FILE = "/var/lib/linfw/counters.json"
@@ -36,22 +35,9 @@ _REFRESH_SEEN = 3600  # how often an unchanged entry's "seen" stamp is rewritten
 
 
 def signature(spec) -> str:
-    """The rule's identity: its definition as if it were switched on, without
-    --reject-with (which is lost while a REJECT rule is off)."""
-    out: List[str] = []
-    i = 0
-    spec = list(spec)
-    while i < len(spec):
-        tok = spec[i]
-        if tok == "--reject-with":
-            i += 2
-        elif tok in ("-j", "--jump") and i + 1 < len(spec) and spec[i + 1].startswith(OFF_PREFIX):
-            out += [tok, spec[i + 1][len(OFF_PREFIX):]]
-            i += 2
-        else:
-            out.append(tok)
-            i += 1
-    return shlex.join(out)
+    """The rule's identity: its definition as if it were switched on (the parser gives a
+    disabled rule back with its real verdict in place of `continue`)."""
+    return " ".join(spec)
 
 
 def store_key(chain: str, sig: str, occurrence: int) -> str:

@@ -2,24 +2,29 @@ import json
 
 import pytest
 
-from linfw.counters import CounterStore, assign_keys, signature
+from linfw.counters import CounterStore, signature
 from linfw.demo import DemoRunner
 from linfw.firewall import Firewall
 from linfw.model import FirewallError, NewRule
-from linfw.parser import parse_save
+from linfw.parser import parse_listing
 
 BOOT = ["boot-1"]
 
 
 def save(*rules, policy="ACCEPT"):
-    """iptables-save -c text with (pkts, bytes, 'rule text') per INPUT rule."""
-    lines = ["*filter", f":INPUT {policy} [0:0]", ":FORWARD ACCEPT [0:0]", ":OUTPUT ACCEPT [0:0]"]
-    lines += [f"[{p}:{b}] -A INPUT {spec}" for p, b, spec in rules]
-    return "\n".join(lines + ["COMMIT"]) + "\n"
+    """`nft list table` text with (pkts, bytes, 'rule words') per INPUT rule; a rule may carry its comment."""
+    lines = ["table ip linfw {", "\tchain input {", f"\t\ttype filter hook input priority filter; policy {policy.lower()};"]
+    for p, b, spec in rules:
+        head, _, tail = spec.rpartition(" ")
+        tag = ""
+        if tail.startswith("off:"):
+            head, tail, tag = head, "continue", ' comment "linfw:' + spec.rsplit(" ", 1)[1] + '"'
+        lines.append(f"\t\t{head} counter packets {p} bytes {b} {tail}{tag}")
+    return "\n".join(lines + ["\t}", "}"]) + "\n"
 
 
 def totals(store, *rules):
-    return store.update(parse_save(save(*rules)))
+    return store.update(parse_listing(save(*rules)))
 
 
 @pytest.fixture
@@ -28,8 +33,8 @@ def store(tmp_path):
     return CounterStore(str(tmp_path / "counters.json"), epoch=lambda: BOOT[0])
 
 
-SSH = "-p tcp --dport 22 -j ACCEPT"
-WEB = "-p tcp --dport 80 -j ACCEPT"
+SSH = "tcp dport 22 accept"
+WEB = "tcp dport 80 accept"
 
 
 def test_totals_follow_the_kernel_counters(store):
@@ -40,7 +45,7 @@ def test_totals_follow_the_kernel_counters(store):
 
 def test_counter_reset_never_lowers_the_total(store):
     totals(store, (100, 10_000, SSH))
-    assert totals(store, (0, 0, SSH)) == {"INPUT:1": (100, 10_000)}  # kernel counters zeroed (iptables -Z, restore)
+    assert totals(store, (0, 0, SSH)) == {"INPUT:1": (100, 10_000)}  # kernel counters zeroed (a reload of the table)
     assert totals(store, (7, 700, SSH)) == {"INPUT:1": (107, 10_700)}
     assert totals(store, (3, 300, SSH)) == {"INPUT:1": (110, 11_000)}  # reset again
 
@@ -57,7 +62,7 @@ def test_total_survives_moving_and_switching_off(store):
     totals(store, (50, 5000, SSH), (20, 2000, WEB))
     moved = totals(store, (20, 2000, WEB), (50, 5000, SSH))  # same rules, other order
     assert moved == {"INPUT:1": (20, 2000), "INPUT:2": (50, 5000)}
-    off = totals(store, (20, 2000, WEB), (55, 5500, "-p tcp --dport 22 -j LINFW_OFF_ACCEPT"))
+    off = totals(store, (20, 2000, WEB), (55, 5500, "tcp dport 22 off:accept"))
     assert off["INPUT:2"] == (55, 5500)  # a disabled rule keeps its identity
 
 
@@ -69,15 +74,17 @@ def test_identical_rules_are_counted_separately(store):
 def test_totals_persist_in_the_file_and_forgotten_rules_expire(store, tmp_path):
     totals(store, (40, 400, SSH))
     other = CounterStore(store.path, epoch=lambda: BOOT[0])  # another process (the service)
-    assert other.update(parse_save(save((0, 0, SSH)))) == {"INPUT:1": (40, 400)}
+    assert other.update(parse_listing(save((0, 0, SSH)))) == {"INPUT:1": (40, 400)}
     data = json.load(open(store.path))
-    assert list(data["rules"]) == ["INPUT|-p tcp --dport 22 -j ACCEPT|0"]
-    store.update(parse_save(save()), now=10**10)  # the rule is gone for more than 30 days
+    assert list(data["rules"]) == ["INPUT|tcp dport 22 accept|0"]
+    store.update(parse_listing(save()), now=10**10)  # the rule is gone for more than 30 days
     assert json.load(open(store.path))["rules"] == {}
 
 
-def test_signature_ignores_the_off_chain_and_reject_with():
-    assert signature(["-p", "tcp", "-j", "LINFW_OFF_REJECT"]) == signature(["-p", "tcp", "-j", "REJECT", "--reject-with", "icmp-port-unreachable"])
+def test_a_disabled_rule_has_the_signature_of_the_enabled_one():
+    on = parse_listing(save((1, 1, "tcp dport 22 accept"))).rules["INPUT"][0]
+    off = parse_listing(save((1, 1, "tcp dport 22 off:accept"))).rules["INPUT"][0]
+    assert not off.enabled and signature(on.spec) == signature(off.spec) == "tcp dport 22 accept"
 
 
 # -- through the Firewall: edit keeps the total, delete forgets it ------------------
@@ -99,7 +106,7 @@ def shown(firewall):
 
 def set_kernel(runner, port, pkts):
     for entry in runner.rules["INPUT"]:
-        if ["--dport", port] == entry[2][entry[2].index("--dport"):][:2] if "--dport" in entry[2] else False:
+        if ["dport", port] == entry[2][entry[2].index("dport"):][:2] if "dport" in entry[2] else False:
             entry[0], entry[1] = pkts, pkts * 100
 
 
@@ -121,17 +128,17 @@ def test_failed_edit_leaves_the_total_alone(fw):
     set_kernel(runner, "22", 40)
     shown(firewall)
     rule = firewall.snapshot().rules["INPUT"][2]
-    original = runner.ipt
+    original = runner.nft
 
-    def broken(args):
-        if args[0] == "-R":
+    def broken(lines):
+        if any(line.startswith("flush chain") for line in lines):
             raise FirewallError("boom")
-        original(args)
+        original(lines)
 
-    runner.ipt = broken
+    runner.nft = broken
     with pytest.raises(FirewallError):
         firewall.edit(rule, NewRule("INPUT", "tcp", "DROP", port="2222"))
-    runner.ipt = original
+    runner.nft = original
     set_kernel(runner, "22", 43)  # the kernel counter kept counting: no double counting
     assert shown(firewall)["INPUT:3"] == (43, 4300)
 

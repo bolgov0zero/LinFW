@@ -5,12 +5,8 @@ from datetime import date, datetime
 import pytest
 
 from linfw import nflog
-from linfw.demo import DemoRunner
-from linfw.firewall import Firewall
-from linfw.journal import LogEntry, format_hit, parse_hits
+from linfw.journal import LogEntry, format_hit
 from linfw.logd import HitWriter, entry_from_packet
-from linfw.model import FirewallError, NewRule, nflog_target
-from linfw.parser import parse_save
 
 
 def ipv4(proto, src, dst, sport=0, dport=0, ihl=5):
@@ -145,21 +141,6 @@ def test_journal_prefers_the_logd_files(tmp_path, monkeypatch):
     source, entries = journal.read_entries()
     assert source == "linfw-logd" and entries[0].source == "1.1.1.1"
     assert journal.read_entries("OUTPUT") == ("linfw-logd", [])
-
-
-def test_legacy_log_twins_are_upgraded_to_nflog_keeping_counters():
-    runner = DemoRunner(sample=False, jitter=False)
-    fw = Firewall(runner)
-    fw.ensure_base()
-    legacy = ["-p", "tcp", "--dport", "22", "-m", "comment", "--comment", "linfw:log", "-m", "limit", "--limit", "10/min",
-              "--limit-burst", "10", "-j", "LOG", "--log-prefix", "LINFW:INPUT:DROP: ", "--log-level", "4"]
-    runner.rules["INPUT"].append([9, 99, legacy])
-    runner.rules["INPUT"].append([0, 0, ["-p", "tcp", "--dport", "22", "-j", "DROP"]])
-    assert not fw.base_ok(fw.snapshot())
-    assert fw.ensure_base()
-    twin = fw.snapshot().rules["INPUT"][-2]
-    assert twin.spec[-6:] == tuple(nflog_target("INPUT", "DROP")) and twin.pkts == 9 and twin.is_log
-    assert fw.base_ok(fw.snapshot()) and not fw.ensure_base()
 
 
 def test_reader_filters_chain_and_action_independently(tmp_path):

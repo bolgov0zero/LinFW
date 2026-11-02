@@ -1,85 +1,84 @@
 from __future__ import annotations
 
-import os
+import ipaddress
 import subprocess
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
 from . import journal, lists as lst, persist
 from .counters import CounterStore, assign_keys, signature, store_key
 from .journal import LogEntry
 from .model import (
-    CHAINS,
-    OFF_CHAINS,
-    OFF_PREFIX,
     ACTIONS,
+    BASE_TAG,
+    CHAINS,
+    FAMILY,
+    LOG_TAG,
+    RULE_TAG,
+    TABLE,
     FirewallError,
     NewRule,
     Rule,
     base_ids,
-    base_specs,
-    nflog_target,
+    base_spec,
+    log_tokens,
 )
-from .parser import Snapshot, parse_save
+from .parser import Snapshot, parse_listing
+from .render import chain_commands, rule_text, ruleset_text, table_line
+
+
+def _clean_error(text: str) -> str:
+    """`/dev/stdin:3:9-12: Error: No such file or directory` + source echo -> the message alone."""
+    for line in text.splitlines():
+        if "Error:" in line:
+            return line.split("Error:", 1)[1].strip()
+    return text.strip().splitlines()[0] if text.strip() else ""
 
 
 class SystemRunner:
-    """Talks to the real iptables."""
+    """Talks to the real nft."""
 
     def __init__(self) -> None:
-        self.iptables = persist.find_binary("iptables")
-        self.iptables_save = persist.find_binary("iptables-save")
-        if not (self.iptables and self.iptables_save):
-            raise FirewallError("iptables не найден. Установите пакет iptables.")
+        self.nft_binary = persist.find_binary("nft")
+        if not self.nft_binary:
+            raise FirewallError("nft не найден. Установите пакет nftables.")
 
-    def _run(self, argv: List[str]) -> str:
+    def _run(self, argv: List[str], stdin: Optional[str] = None) -> subprocess.CompletedProcess:
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+            return subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=15)
         except subprocess.TimeoutExpired:
-            raise FirewallError("iptables не ответил за 15 секунд") from None
+            raise FirewallError("nft не ответил за 15 секунд") from None
+
+    def list_table(self) -> Optional[str]:
+        """`nft list table ip linfw`; None when the table does not exist yet."""
+        r = self._run([self.nft_binary, "list", "table", FAMILY, TABLE])
         if r.returncode:
-            raise FirewallError((r.stderr or r.stdout).strip() or f"iptables завершился с кодом {r.returncode}")
+            message = _clean_error(r.stderr or r.stdout)
+            if "No such file or directory" in message:
+                return None
+            raise FirewallError(message or f"nft завершился с кодом {r.returncode}")
         return r.stdout
 
-    def ipt(self, args: List[str]) -> None:
-        self._run([self.iptables, "-w", *args])
+    def nft(self, lines: List[str]) -> None:
+        """Run the commands as one transaction: all of them take effect or none."""
+        r = self._run([self.nft_binary, "-f", "-"], "\n".join(lines) + "\n")
+        if r.returncode:
+            raise FirewallError(_clean_error(r.stderr or r.stdout) or f"nft завершился с кодом {r.returncode}")
 
-    def save_text(self) -> str:
-        return self._run([self.iptables_save, "-c", "-t", "filter"])
+    def problem(self) -> Optional[str]:
+        """Why nftables cannot be used here, or None if it can."""
+        r = self._run([self.nft_binary, "list", "tables"])
+        return _clean_error(r.stderr or r.stdout) or "nft недоступен" if r.returncode else None
 
-    def persist(self) -> str:
-        return persist.save(self._run([self.iptables_save]))
+    def persist(self, text: str) -> str:
+        return persist.save(text)
 
     def persist_info(self) -> Optional[str]:
         return persist.describe()
 
     def read_journal(self, chain: Optional[str] = None, actions=None, limit: int = journal.MAX_ENTRIES) -> Tuple[str, List[LogEntry]]:
         return journal.read_entries(chain, actions, limit)
-
-    def ipset(self, args: List[str], stdin: Optional[str] = None) -> str:
-        binary = persist.find_binary("ipset")
-        if not binary:
-            raise FirewallError("Не установлен пакет ipset: адресные списки недоступны")
-        try:
-            r = subprocess.run([binary, *args], input=stdin, capture_output=True, text=True, timeout=30)
-        except subprocess.TimeoutExpired:
-            raise FirewallError("ipset не ответил за 30 секунд") from None
-        if r.returncode:
-            message = (r.stderr or r.stdout).strip().splitlines()[0] if (r.stderr or r.stdout).strip() else ""
-            raise FirewallError(message.split(": ", 1)[-1] or f"ipset завершился с кодом {r.returncode}")
-        return r.stdout
-
-    def ipset_problem(self) -> Optional[str]:
-        """Why address lists cannot be used here, or None if they can."""
-        try:
-            self.ipset(["list", "-n"])
-        except FirewallError as exc:
-            return str(exc)
-        return None
-
-    def ipset_persistent(self) -> bool:
-        """Does a plugin save the lists and restore them before the rules at boot?"""
-        return os.path.exists("/usr/share/netfilter-persistent/plugins.d/10-ipset")
 
     def logd_state(self) -> Optional[str]:
         """systemd's view of linfw-logd ("active", "inactive", "failed" ...), None without systemd."""
@@ -93,23 +92,40 @@ class SystemRunner:
         return r.stdout.strip() or "unknown"
 
 
-class Firewall:
-    """Rule operations. Every mutation re-reads the chain first and refuses to
-    act if the rule is no longer where the UI last saw it.
+def _blocks(rules: List[Rule]) -> List[List[Rule]]:
+    """The chain as logical blocks: a log twin goes together with the rule below it."""
+    blocks: List[List[Rule]] = []
+    for rule in rules:
+        if blocks and blocks[-1][-1].is_log:
+            blocks[-1].append(rule)
+        else:
+            blocks.append([rule])
+    return blocks
 
-    A rule with logging on is a *block* of two iptables rules: the hidden LOG
-    twin directly above it, then the rule itself. Every operation below keeps
-    the two together."""
+
+def _flat(blocks: List[List[Rule]]) -> List[Rule]:
+    return [r for block in blocks for r in block]
+
+
+class Firewall:
+    """Rule operations. Every mutation re-reads the table first and refuses to act if the
+    rule is no longer where the UI last saw it. A chain is changed by rewriting it
+    (counters carried over) in one nft transaction.
+
+    A rule with logging on is a *block* of two rules: the hidden log twin directly above it,
+    then the rule itself. Every operation below keeps the two together."""
 
     def __init__(self, runner, counters: Optional[CounterStore] = None) -> None:
         self.runner = runner
         self.counters = counters  # running totals that survive resets of the kernel counters
 
     def snapshot(self) -> Snapshot:
-        return parse_save(self.runner.save_text())
+        return parse_listing(self.runner.list_table())
 
     def persist(self) -> str:
-        return self.runner.persist()
+        text = self.runner.list_table()
+        snap = parse_listing(text)
+        return self.runner.persist(ruleset_text(snap, lst.parse_sets(text or "")))
 
     def persist_info(self) -> Optional[str]:
         return self.runner.persist_info()
@@ -127,52 +143,68 @@ class Firewall:
             return {}, str(exc)
 
     def lists_problem(self) -> Optional[str]:
-        return self.runner.ipset_problem()
+        return self.runner.problem()
 
     def lists_persistent(self) -> bool:
-        return self.runner.ipset_persistent()
+        """Lists are saved in the same file as the rules."""
+        return self.runner.persist_info() is not None
 
     def lists(self) -> Dict[str, List[str]]:
         """{name: entries} of LinFW's lists."""
-        return lst.parse_save(self.runner.ipset(["save"]))
+        return lst.parse_sets(self.runner.list_table() or "")
 
     def list_usage(self, snap: Optional[Snapshot] = None) -> Dict[str, List[str]]:
-        """{name: ["INPUT #3", ...]}: which rules use each list (also negated ones)."""
+        """{name: ["INPUT #3", ...]}: which rules use each list."""
         snap = snap or self.snapshot()
         usage: Dict[str, List[str]] = {}
         for chain in CHAINS:
             for rule in snap.rules[chain]:
                 if rule.hidden:
                     continue
-                for tok in rule.spec:
-                    if tok.startswith(lst.LIST_PREFIX):
-                        usage.setdefault(tok[len(lst.LIST_PREFIX):], []).append(f"{chain} #{rule.number}")
+                for value in (rule.source, rule.destination):
+                    name = lst.list_ref(value)
+                    if name:
+                        usage.setdefault(name, []).append(f"{chain} #{rule.number}")
         return usage
 
     def create_list(self, name: str) -> None:
         name = lst.check_name(name)
         if name in self.lists():
             raise FirewallError(f"Список «{name}» уже есть")
-        self.runner.ipset(["create", lst.set_name(name), "hash:net", "family", "inet", "maxelem", str(lst.MAX_ELEMENTS)])
+        self.runner.nft([table_line(), f"add set {FAMILY} {TABLE} {name} {{ type ipv4_addr; flags interval; }}"])
 
     def delete_list(self, name: str) -> None:
         used = self.list_usage().get(name)
         if used:
             raise FirewallError(f"Список «{name}» используется в правилах: {', '.join(used)}. Сначала измените или удалите их.")
-        self.runner.ipset(["destroy", lst.set_name(name)])
+        self.runner.nft([f"delete set {FAMILY} {TABLE} {name}"])
 
     def add_to_list(self, name: str, entries: List[str]) -> int:
-        """Add already validated entries; returns how many were new."""
-        entries = [lst.normalize_entry(e) for e in entries]
-        have = set(self.lists().get(name, []))
-        new = [e for e in dict.fromkeys(entries) if e not in have]
-        if new:
-            self.runner.ipset(["restore", "-exist"], "".join(f"add {lst.set_name(name)} {e}\n" for e in new))
-        return len(new)
+        """Add already validated entries; returns how many were added.
+
+        A set of intervals refuses elements that overlap, so an address that is already
+        covered by a network in the list (or in this batch) is not added, and a network that
+        covers addresses already in the list takes their place."""
+        have = self.lists().get(name, [])
+        nets = {e: ipaddress.IPv4Network(e, strict=False) for e in have if "-" not in e}
+        kept: Dict[str, ipaddress.IPv4Network] = {}
+        for entry in sorted(dict.fromkeys(lst.normalize_entry(e) for e in entries), key=lambda e: int(e.partition("/")[2] or 32)):
+            net = ipaddress.IPv4Network(entry, strict=False)
+            if not any(net.subnet_of(other) for other in [*nets.values(), *kept.values()]):
+                kept[entry] = net
+        covered = [e for e, n in nets.items() if any(n.subnet_of(k) for k in kept.values())]
+        lines = []
+        if covered:
+            lines.append(f"delete element {FAMILY} {TABLE} {name} {{ {', '.join(covered)} }}")
+        if kept:
+            lines.append(f"add element {FAMILY} {TABLE} {name} {{ {', '.join(kept)} }}")
+            self.runner.nft(lines)
+        return len(kept)
 
     def remove_from_list(self, name: str, entries: List[str]) -> None:
-        if entries:
-            self.runner.ipset(["restore", "-exist"], "".join(f"del {lst.set_name(name)} {e}\n" for e in entries))
+        present = [e for e in dict.fromkeys(entries) if e in self.lists().get(name, [])]
+        if present:
+            self.runner.nft([f"delete element {FAMILY} {TABLE} {name} {{ {', '.join(present)} }}"])
 
     def _check_lists(self, new: NewRule) -> None:
         wanted = new.used_lists()
@@ -204,112 +236,125 @@ class Firewall:
         twins = [r for rules in self.snapshot().rules.values() for r in rules if r.is_log]
         return len(twins), sum(r.pkts for r in twins), self.runner.logd_state()
 
+    # -- building blocks of the changes ----------------------------------
+
+    @staticmethod
+    def _fresh(chain: str, index: int, spec: List[str], tag: str, action: str, enabled: bool = True, log: bool = False) -> Rule:
+        """A rule that has just been made: counters at zero, columns not needed (only the text is written)."""
+        return Rule(chain, index, 0, 0, "all", "", "", "", action, enabled, tuple(spec), (), 0, log, tag)
+
+    def _block_for(self, chain: str, new: NewRule, enabled: bool, counters: Optional[Tuple[int, int]] = None) -> List[Rule]:
+        action = new.action.lower()
+        main = self._fresh(chain, 0, new.to_spec(), RULE_TAG if enabled else f"linfw:off:{action}" + (":log" if new.log else ""),
+                           action, enabled, new.log)
+        if counters:
+            main = replace(main, pkts=counters[0], bytes=counters[1])
+        if new.log and enabled:
+            return [self._fresh(chain, 0, new.to_log_spec(), LOG_TAG, "log"), main]
+        return [main]
+
+    def _write(self, snap: Snapshot, changes: Dict[str, List[Rule]]) -> None:
+        """Rewrite the chains in `changes` (and create the table and chains if missing), in one transaction."""
+        lines = [table_line()]
+        for chain, rules in changes.items():
+            lines += chain_commands(chain, rules, snap)
+        self.runner.nft(lines)
+
+    def _current(self, rule: Rule) -> Tuple[Snapshot, List[Rule]]:
+        snap = self.snapshot()
+        rules = snap.rules[rule.chain]
+        if rule.index > len(rules) or rules[rule.index - 1].spec != rule.spec or rules[rule.index - 1].tag != rule.tag:
+            raise FirewallError("Правила изменились снаружи — список обновлён, повторите действие")
+        return snap, rules
+
+    @staticmethod
+    def _refuse_hidden(rule: Rule) -> None:
+        if rule.hidden:
+            raise FirewallError("Служебные правила нельзя изменять")
+
+    @staticmethod
+    def _block_of(blocks: List[List[Rule]], rule: Rule) -> int:
+        return next(i for i, b in enumerate(blocks) if any(r.index == rule.index for r in b))
+
     # -- rule operations -------------------------------------------------
 
     def add(self, new: NewRule) -> None:
         new = new.validated()
         self._check_lists(new)
-        if new.log:
-            self.runner.ipt(["-A", new.chain, *new.to_log_spec()])
-        self.runner.ipt(["-A", new.chain, *new.to_spec()])
+        snap = self.snapshot()
+        block = self._block_for(new.chain, new, True)
+        if new.chain not in snap.chains:  # no table yet: make it, with the new rule in it
+            self._write(snap, {new.chain: snap.rules[new.chain] + block})
+        else:  # appending needs no rewrite: the other rules are not touched
+            self.runner.nft([f"add rule {FAMILY} {TABLE} {new.chain.lower()} {rule_text(r)}" for r in block])
 
     def edit(self, rule: Rule, new: NewRule) -> None:
         """Replace a rule in place (same chain, same position, same on/off state).
-        Counters start from zero since it is, in effect, a different rule."""
-        rules = self._current(rule)
+        Its running total follows it to the new definition."""
+        snap, rules = self._current(rule)
         self._refuse_hidden(rule)
         new = new.validated()
         self._check_lists(new)
         if new.chain != rule.chain:
             raise FirewallError("Цепочку существующего правила изменить нельзя")
-        spec = new.to_spec()
-        if not rule.enabled:
-            self._ensure_off_chains()
-            spec[-1] = OFF_PREFIX + new.action
-        n = rule.index
-        had_twin = self._has_twin(rules, n)
+        blocks = _blocks(rules)
+        at = self._block_of(blocks, rule)
+        blocks[at] = self._block_for(rule.chain, new, rule.enabled)
         # the total follows the rule; the lock keeps the sampler out until the kernel counter has restarted
         with self.counters.locked() if self.counters else nullcontext():
-            moved = self._move_total(rule, spec)
+            moved = self._move_total(snap, rule, new.to_spec())
             try:
-                self.runner.ipt(["-R", rule.chain, str(n), *spec])
+                self._write(snap, {rule.chain: _flat(blocks)})
             except FirewallError:
                 if moved:
                     self.counters.restore(*moved)
                 raise
-        if new.log and had_twin:
-            self.runner.ipt(["-R", rule.chain, str(n - 1), *new.to_log_spec(rule.enabled)])
-        elif new.log:
-            self.runner.ipt(["-I", rule.chain, str(n), *new.to_log_spec(rule.enabled)])
-        elif had_twin:
-            self.runner.ipt(["-D", rule.chain, str(n - 1)])
 
     def delete(self, rule: Rule) -> None:
-        rules = self._current(rule)
+        snap, rules = self._current(rule)
         self._refuse_hidden(rule)
-        start = self._block_start(rules, rule.index)
-        key = self._store_key(self.snapshot(), rule) if self.counters else None
-        for idx in range(rule.index, start - 1, -1):
-            self.runner.ipt(["-D", rule.chain, str(idx)])
+        key = self._store_key(snap, rule) if self.counters else None
+        blocks = _blocks(rules)
+        del blocks[self._block_of(blocks, rule)]
+        self._write(snap, {rule.chain: _flat(blocks)})
         if key:
             self.counters.forget(key)
 
     def move(self, rule: Rule, delta: int) -> bool:
-        """Move a rule (with its log twin) one step up (-1) or down (+1). Copies
-        are inserted before the originals are removed, so the chain never has a
-        gap. Counters are carried over."""
-        rules = self._current(rule)
+        """Move a rule (with its log twin) one step up (-1) or down (+1). The chain is rewritten
+        in one transaction, so there is never a moment without the rule. Counters are carried over."""
+        snap, rules = self._current(rule)
         self._refuse_hidden(rule)
-        n = rule.index
-        start = self._block_start(rules, n)
-        size = n - start + 1
-        block = [self._with_counters(r) for r in rules[start - 1:n]]
-        if delta < 0:
-            above = start - 1  # last rule of the previous block
-            # never go above the base rules at the top of the chain
-            if above < 1 or rules[above - 1].base_id:
-                return False
-            target = self._block_start(rules, above)
-            self._insert_block(rule.chain, target, len(rules), block)
-            old = range(n + size, start + size - 1, -1)
-        else:
-            if n == len(rules):
-                return False
-            below = n + 1 if not rules[n].is_log else n + 2  # last rule of the next block
-            self._insert_block(rule.chain, below + 1, len(rules), block)
-            old = range(n, start - 1, -1)
-        for idx in old:
-            self.runner.ipt(["-D", rule.chain, str(idx)])
+        blocks = _blocks(rules)
+        at = self._block_of(blocks, rule)
+        other = at + delta
+        if other < 0 or other >= len(blocks):
+            return False
+        if blocks[other][-1].base_id:  # never above the base rules at the top of the chain
+            return False
+        blocks[at], blocks[other] = blocks[other], blocks[at]
+        self._write(snap, {rule.chain: _flat(blocks)})
         return True
 
     def toggle(self, rule: Rule) -> bool:
         """Enable/disable a rule in place (its log twin follows). Returns the new
         enabled state."""
-        rules = self._current(rule)
+        snap, rules = self._current(rule)
         self._refuse_hidden(rule)
         action = rule.action.upper()
         if action not in ACTIONS:
             raise FirewallError(f"Правило с действием {action} нельзя выключить")
-        spec = list(rule.spec)
-        j = self._target_index(spec)
         enable = not rule.enabled
-        if not enable:
-            self._ensure_off_chains()
-            spec[j + 1] = OFF_PREFIX + action
-            # --reject-with is only valid together with the REJECT target
-            while "--reject-with" in spec:
-                k = spec.index("--reject-with")
-                del spec[k:k + 2]
-        else:
-            spec[j + 1] = action
-        main = ["-R", rule.chain, str(rule.index), *spec, "-c", str(rule.pkts), str(rule.bytes)]
-        if self._has_twin(rules, rule.index):
-            twin = rules[rule.index - 2]
-            twin_spec = self._twin_spec(twin, rule.chain, action, on=enable)
-            self.runner.ipt(
-                ["-R", rule.chain, str(rule.index - 1), *twin_spec, "-c", str(twin.pkts), str(twin.bytes)]
-            )
-        self.runner.ipt(main)
+        blocks = _blocks(rules)
+        at = self._block_of(blocks, rule)
+        main = replace(blocks[at][-1], enabled=enable, log=rule.log)
+        block = [main]
+        if enable and rule.log:
+            # the twin is made again from the rule's own matches
+            matches = list(rule.spec[:-1])
+            block.insert(0, self._fresh(rule.chain, 0, matches + log_tokens(rule.chain, rule.action), LOG_TAG, "log"))
+        blocks[at] = block
+        self._write(snap, {rule.chain: _flat(blocks)})
         return enable
 
     # -- base rules ------------------------------------------------------
@@ -321,69 +366,47 @@ class Firewall:
             r.base_id for r in rules[len(want):]
         )
 
-    @staticmethod
-    def _legacy_twins(snap: Snapshot) -> List[Rule]:
-        """Twins made by earlier versions with the LOG target (kernel log), now replaced by NFLOG."""
-        return [
-            r
-            for rules in snap.rules.values()
-            for r in rules
-            if r.is_log and any(tok == "-j" and r.spec[i + 1] == "LOG" for i, tok in enumerate(r.spec[:-1]))
-        ]
-
     def base_ok(self, snap: Snapshot) -> bool:
-        return all(self._chain_base_ok(c, snap.rules[c]) for c in CHAINS) and not self._legacy_twins(snap)
-
-    def _upgrade_legacy_twins(self, snap: Snapshot) -> bool:
-        legacy = self._legacy_twins(snap)
-        for twin in legacy:
-            spec = list(twin.spec)
-            j = self._target_index(spec)
-            options = spec[j + 2:]
-            prefix = options[options.index("--log-prefix") + 1] if "--log-prefix" in options else None
-            spec = spec[:j] + nflog_target(twin.chain, "", prefix)
-            self.runner.ipt(["-R", twin.chain, str(twin.index), *spec, "-c", str(twin.pkts), str(twin.bytes)])
-        return bool(legacy)
+        return snap.exists and all(c in snap.chains and self._chain_base_ok(c, snap.rules[c]) for c in CHAINS)
 
     def ensure_base(self) -> bool:
-        """Put the base rules (loopback, established/related) at the top of every
-        chain, and move logging twins from the old LOG target to NFLOG. Returns
-        True if anything had to be changed. New copies go in before stale ones are
-        removed, so traffic is never left unprotected."""
+        """Create the table, put the base rules (loopback, established/related) at the top of every
+        chain. Returns True if anything had to be changed. All chains are written in one
+        transaction, so traffic is never left unprotected."""
         snap = self.snapshot()
-        changed = self._upgrade_legacy_twins(snap)
-        if changed:
-            snap = self.snapshot()
+        changes: Dict[str, List[Rule]] = {}
         for chain in CHAINS:
-            if self._chain_base_ok(chain, snap.rules[chain]):
+            if chain in snap.chains and self._chain_base_ok(chain, snap.rules[chain]):
                 continue
-            changed = True
-            specs = base_specs(chain)
-            for pos, spec in enumerate(specs, start=1):
-                self.runner.ipt(["-I", chain, str(pos), *spec])
-            stale = [r for r in self.snapshot().rules[chain] if r.base_id and r.index > len(specs)]
-            for r in sorted(stale, key=lambda r: r.index, reverse=True):
-                self.runner.ipt(["-D", chain, str(r.index)])
-        return changed
+            have = {r.base_id: r for r in snap.rules[chain] if r.base_id}
+            base = []
+            for tag in base_ids(chain):
+                old = have.get(tag)
+                base.append(self._fresh(chain, 0, base_spec(chain, tag), tag, "accept") if old is None else old)
+            changes[chain] = base + [r for r in snap.rules[chain] if not r.base_id]
+        if changes:
+            self._write(snap, changes)
+        return bool(changes)
 
     def remove_base(self) -> bool:
-        removed = False
         snap = self.snapshot()
-        for chain in CHAINS:
-            for r in sorted((r for r in snap.rules[chain] if r.base_id), key=lambda r: r.index, reverse=True):
-                self.runner.ipt(["-D", chain, str(r.index)])
-                removed = True
-        return removed
+        changes = {
+            chain: [r for r in snap.rules[chain] if not r.base_id]
+            for chain in CHAINS
+            if any(r.base_id for r in snap.rules[chain])
+        }
+        if changes:
+            self._write(snap, changes)
+        return bool(changes)
 
     # -- helpers ---------------------------------------------------------
 
-    def _move_total(self, rule: Rule, new_spec: List[str]) -> Optional[Tuple[str, str, Dict]]:
+    def _move_total(self, snap: Snapshot, rule: Rule, new_spec: List[str]) -> Optional[Tuple[str, str, Dict]]:
         """Before a rule is rewritten, hand its running total to the new definition
         (the kernel counter restarts at zero, the total must not).
         Returns (old key, new key, displaced entry) for a rollback."""
         if not self.counters:
             return None
-        snap = self.snapshot()
         old_key = self._store_key(snap, rule)
         if not old_key:
             return None
@@ -399,53 +422,5 @@ class Firewall:
             return None
         return (old_key, new_key, entry) if entry else None
 
-    @staticmethod
-    def _refuse_hidden(rule: Rule) -> None:
-        if rule.hidden:
-            raise FirewallError("Служебные правила нельзя изменять")
 
-    @staticmethod
-    def _has_twin(rules: List[Rule], n: int) -> bool:
-        return n >= 2 and rules[n - 2].is_log
-
-    @classmethod
-    def _block_start(cls, rules: List[Rule], n: int) -> int:
-        return n - 1 if cls._has_twin(rules, n) else n
-
-    @staticmethod
-    def _with_counters(rule: Rule) -> List[str]:
-        return [*rule.spec, "-c", str(rule.pkts), str(rule.bytes)]
-
-    @staticmethod
-    def _target_index(spec: List[str]) -> int:
-        try:
-            return next(i for i, t in enumerate(spec) if t in ("-j", "--jump"))
-        except StopIteration:
-            raise FirewallError("У правила нет действия (-j)") from None
-
-    def _twin_spec(self, twin: Rule, chain: str, action: str, on: bool) -> List[str]:
-        spec = list(twin.spec)
-        j = self._target_index(spec)
-        del spec[j:]  # drop the target together with its own options
-        if on:
-            return spec + nflog_target(chain, action)
-        return spec + ["-j", OFF_PREFIX + "LOG"]
-
-    def _current(self, rule: Rule) -> List[Rule]:
-        rules = self.snapshot().rules[rule.chain]
-        if rule.index > len(rules) or rules[rule.index - 1].spec != rule.spec:
-            raise FirewallError("Правила изменились снаружи — список обновлён, повторите действие")
-        return rules
-
-    def _insert_block(self, chain: str, pos: int, count: int, specs: List[List[str]]) -> None:
-        for k, spec in enumerate(specs):
-            if pos + k > count + k:
-                self.runner.ipt(["-A", chain, *spec])
-            else:
-                self.runner.ipt(["-I", chain, str(pos + k), *spec])
-
-    def _ensure_off_chains(self) -> None:
-        existing = self.snapshot().chains
-        for name in OFF_CHAINS:
-            if name not in existing:
-                self.runner.ipt(["-N", name])
+__all__ = ["Firewall", "SystemRunner", "BASE_TAG"]

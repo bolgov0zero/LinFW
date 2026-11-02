@@ -1,6 +1,6 @@
 """The journal of rule hits.
 
-A rule with logging on is preceded by a hidden iptables rule that sends matching
+A rule with logging on is preceded by a hidden nft rule that sends matching
 packets to NFLOG with the prefix "LINFW:<CHAIN>:<ACTION>: ". The linfw-logd
 service records them in one file per day (HITS_DIR/hits-YYYY-MM-DD.log, one
 tab-separated record per line) and deletes files older than RETENTION_DAYS.

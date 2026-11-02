@@ -263,7 +263,7 @@ class LinFWApp(App):
     # -- layout ----------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield TopBar("iptables", self.current)
+        yield TopBar("nftables", self.current)
         yield ChainTabs(*[Tab(name, id=f"tab-{name}") for name in CHAINS], id="chains")
         with Horizontal(id="stats"):
             left, right = Static("", id="stat-chain", classes="panel"), Static("", id="stat-packets", classes="panel")
@@ -505,7 +505,7 @@ class LinFWApp(App):
 
     def _update_status(self) -> None:
         main = self._main()
-        main.query_one(TopBar).set_trail("iptables", self.current)
+        main.query_one(TopBar).set_trail("nftables", self.current)
         main.query_one(TopBar).set_status(self._persist_note)
         total = sum(1 for rules in self.snapshot.rules.values() for r in rules if not r.hidden)
         main.query_one(StatusBar).set_right(f"правил: {total} · списков: {len(self._lists_info[0])}")

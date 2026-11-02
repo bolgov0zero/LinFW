@@ -49,16 +49,16 @@ async def test_toolbar_keys_add_delete_toggle_move():
         # real positions: 0-1 hidden base rules, 2 ssh, 3 web (visible #1, #2)
         await pilot.press("down", "f6")  # disable visible #2
         await pilot.pause(0.3)
-        assert last(3) == "LINFW_OFF_ACCEPT"
+        assert last(3) == "continue"
         assert runner.persist_calls == saved + 1
 
         await pilot.press("f4")  # up: it must stay selected
         await pilot.pause(0.3)
         assert table.cursor_row == 0
-        assert last(2) == "LINFW_OFF_ACCEPT"
+        assert last(2) == "continue"
         await pilot.press("f4")  # already first: it may not climb over the base rules
         await pilot.pause(0.3)
-        assert last(2) == "LINFW_OFF_ACCEPT" and "linfw:base:est" in runner.rules["INPUT"][1][2]
+        assert last(2) == "continue" and runner.rules["INPUT"][1][3] == "linfw:base:est"
         await pilot.press("f5")
         await pilot.pause(0.3)
         assert table.cursor_row == 1
@@ -99,8 +99,8 @@ async def test_add_dialog_and_validation():
         await pilot.click("#save")
         await pilot.pause(0.3)
         assert not isinstance(app.screen, AddRuleScreen)
-        added = [t for _, _, t in runner.rules["INPUT"] if "8080" in t]
-        assert added and added[0][-1] == "ACCEPT"
+        added = [t for _, _, t, _ in runner.rules["INPUT"] if "8080" in t]
+        assert added and added[0][-1] == "accept"
 
 
 async def test_template_modal_applies_ssh():
@@ -113,7 +113,7 @@ async def test_template_modal_applies_ssh():
         assert isinstance(app.screen, TemplateScreen)
         await pilot.press("down", "down", "enter")  # HTTP/HTTPS
         await pilot.pause(0.3)
-        assert any("--dports" in t for _, _, t in runner.rules["INPUT"])
+        assert any("{80,443}" in t for _, _, t, _ in runner.rules["INPUT"])
         assert runner.persist_calls == saved + 1
 
 
@@ -133,7 +133,7 @@ async def test_mouse_click_button_and_cancel():
 
 async def test_switching_to_an_empty_chain_clears_the_table():
     runner = DemoRunner(sample=False, jitter=False)
-    runner.rules["INPUT"].append([0, 0, ["-p", "tcp", "--dport", "22", "-j", "ACCEPT"]])
+    runner.add_rule("INPUT", "tcp dport 22 accept")
     app = LinFWApp(Firewall(runner))
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.pause()
@@ -163,7 +163,7 @@ async def test_double_click_and_enter_open_the_editor():
         await pilot.click("#save")
         await pilot.pause(0.4)
         assert not isinstance(app.screen, AddRuleScreen)
-        assert runner.rules["INPUT"][3][2] == ["-p", "tcp", "--dport", "8443", "-j", "ACCEPT"]
+        assert runner.rules["INPUT"][3][2] == ["tcp", "dport", "8443", "accept"]
         assert table.cursor_row == 1
 
         await pilot.press("up", "enter")  # Enter edits the highlighted rule too
@@ -179,7 +179,7 @@ async def test_double_click_and_enter_open_the_editor():
 
 async def test_complex_rule_is_not_editable_in_dialog():
     runner = DemoRunner(sample=False, jitter=False)
-    runner.rules["INPUT"].append([0, 0, ["-i", "eth0", "-j", "DROP"]])
+    runner.add_rule("INPUT", 'iifname "eth0" drop', tag="")
     app = LinFWApp(Firewall(runner))
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.pause()
@@ -205,7 +205,7 @@ async def test_log_checkbox_creates_a_logged_rule_and_marks_the_row():
         app.screen.query_one("#log", Checkbox).value = True
         await pilot.click("#save")
         await pilot.pause(0.5)
-        assert any("NFLOG" in t for _, _, t in runner.rules["INPUT"])
+        assert any("log" in t for _, _, t, _ in runner.rules["INPUT"])
         table = app.query_one(DataTable)
         last = [str(c) for c in table.get_row_at(table.row_count - 1)]
         assert last[-1] == "accept ●" and last[6] == "9999"
@@ -302,7 +302,7 @@ async def test_empty_journal_explains_why():
         assert "ещё ни разу не сработали" in status()
 
         for entry in runner.rules["INPUT"]:
-            if "NFLOG" in entry[2]:
+            if entry[3] == "linfw:log":
                 entry[0] = 3
         runner.logd_state = lambda: "failed"
         await app.screen._load()
@@ -317,7 +317,7 @@ async def test_table_shows_running_totals_that_survive_a_kernel_reset():
     from linfw.counters import CounterStore
 
     runner = DemoRunner(sample=False, jitter=False)
-    runner.rules["INPUT"].append([1500, 90_000, ["-p", "tcp", "--dport", "22", "-j", "ACCEPT"]])
+    runner.add_rule("INPUT", "tcp dport 22 accept", 1500, 90_000)
     app = LinFWApp(Firewall(runner, CounterStore(None)))
     async with app.run_test(size=(120, 36)) as pilot:
         await pilot.pause()
@@ -379,7 +379,7 @@ async def test_segments_work_by_click_and_arrow_keys():
 
 
 def runner_rules_has_drop_all(app):
-    return any(t == ["-j", "DROP"] for _, _, t in app.fw.runner.rules["INPUT"])
+    return any(t == ["drop"] for _, _, t, _ in app.fw.runner.rules["INPUT"])
 
 
 async def test_template_dialog_button_and_click():
@@ -394,7 +394,7 @@ async def test_template_dialog_button_and_click():
         await pilot.click("#apply")
         await pilot.pause(0.5)
         assert not isinstance(app.screen, TemplateScreen)
-        assert any(t[:2] == ["-p", "icmp"] for _, _, t in runner.rules["INPUT"])
+        assert any(t[:3] == ["ip", "protocol", "icmp"] for _, _, t, _ in runner.rules["INPUT"])
 
         await pilot.press("f3")
         await pilot.pause()
@@ -552,7 +552,7 @@ async def test_interface_polish_theme_tabs_empty_state_and_toolbar():
 
         detail = str(app.query_one("#detail", Static).render())
         assert "порт" in detail or "Отклоняет" in detail or "Разрешает" in detail or "Отбрасывает" in detail
-        assert "-A INPUT" in detail  # the readable sentence is followed by the raw rule
+        assert "nft add rule ip linfw input" in detail  # the readable sentence is followed by the raw rule
 
         await pilot.press("right")  # OUTPUT has no rules: a hint instead of an empty table
         await pilot.pause(0.4)
@@ -574,7 +574,7 @@ async def test_deep_blue_look_header_meter_panels_and_dialog_frames():
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause(0.5)
         crumb = str(app.query_one("#crumb", Static).render())
-        assert crumb.split() == ["iptables", "›", "INPUT"]
+        assert crumb.split() == ["nftables", "›", "INPUT"]
         await pilot.press("right")
         await pilot.pause(0.3)
         assert str(app.query_one("#crumb", Static).render()).split()[-1] == "OUTPUT"

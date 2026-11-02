@@ -7,7 +7,7 @@ from linfw.demo import DemoRunner
 from linfw.firewall import Firewall
 from linfw.lists_ui import AddAddressesScreen, ListsScreen, NewListScreen
 from linfw.model import FirewallError, NewRule
-from linfw.parser import parse_save
+from linfw.parser import parse_listing
 from linfw.screens import AddRuleScreen, ConfirmScreen, PickListScreen
 
 
@@ -40,12 +40,19 @@ def test_names_and_references():
     assert lst.list_ref("@office") == "office" and lst.list_ref("10.0.0.1") is None and lst.list_ref("@") is None
 
 
-def test_parse_save_keeps_only_our_sets_sorted():
+def test_parse_sets_reads_elements_on_one_or_many_lines_sorted():
     text = (
-        "create lf_office hash:net family inet hashsize 1024 maxelem 65536\nadd lf_office 192.168.1.0/24\nadd lf_office 10.0.0.5\n"
-        "create f2b-sshd hash:ip timeout 600\nadd f2b-sshd 1.2.3.4 timeout 100\ncreate lf_empty hash:net family inet\n"
+        "table ip linfw {\n\tset office {\n\t\ttype ipv4_addr\n\t\tflags interval\n"
+        "\t\telements = { 192.168.1.0/24, 10.0.0.5 }\n\t}\n\n"
+        "\tset empty {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t}\n\n"
+        "\tset big {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\telements = { 10.9.0.0/16, 10.1.0.0-10.2.255.255,\n"
+        "\t\t\t     10.3.0.1 }\n\t}\n\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n"
+        "\t\tip saddr @office counter packets 0 bytes 0 drop\n\t}\n}\n"
     )
-    assert lst.parse_save(text) == {"empty": [], "office": ["10.0.0.5", "192.168.1.0/24"]}
+    assert lst.parse_sets(text) == {
+        "big": ["10.1.0.0-10.2.255.255", "10.3.0.1", "10.9.0.0/16"], "empty": [], "office": ["10.0.0.5", "192.168.1.0/24"],
+    }
+    assert lst.parse_sets("") == {}
 
 
 # -- rules that use lists ---------------------------------------------------------
@@ -53,28 +60,23 @@ def test_parse_save_keeps_only_our_sets_sorted():
 
 def test_new_rule_spec_uses_the_set_match():
     rule = NewRule("INPUT", "tcp", "DROP", source="@blocklist", destination="@office", port="22").validated()
-    assert rule.to_spec() == [
-        "-p", "tcp", "-m", "set", "--match-set", "lf_blocklist", "src", "-m", "set", "--match-set", "lf_office", "dst",
-        "--dport", "22", "-j", "DROP",
-    ]
+    assert rule.to_spec() == ["tcp", "dport", "22", "ip", "saddr", "@blocklist", "ip", "daddr", "@office", "drop"]
     assert rule.used_lists() == ["blocklist", "office"]
     with pytest.raises(ValueError):
         NewRule(source="@bad name").validated()
 
 
-def test_parser_turns_our_set_match_into_a_column_value_and_leaves_foreign_ones():
-    snap = parse_save(
-        "*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\n"
-        "[5:300] -A INPUT -m set --match-set lf_blocklist src -p tcp -m tcp --dport 22 -j DROP\n"
-        "[0:0] -A INPUT -m set --match-set lf_a src -m set --match-set lf_b dst -j ACCEPT\n"
-        "[0:0] -A INPUT -m set --match-set f2b-sshd src -j DROP\n"
-        "[0:0] -A INPUT -m set ! --match-set lf_x src -j DROP\nCOMMIT\n"
+def test_parser_turns_a_set_match_into_a_column_value_and_leaves_negated_ones():
+    snap = parse_listing(
+        "table ip linfw {\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n"
+        "\t\tip saddr @blocklist tcp dport 22 counter packets 5 bytes 300 drop\n"
+        "\t\tip saddr @a ip daddr @b counter packets 0 bytes 0 accept\n"
+        "\t\tip saddr != @x counter packets 0 bytes 0 drop\n\t}\n}\n"
     )
-    ours, both, foreign, negated = snap.rules["INPUT"]
+    ours, both, negated = snap.rules["INPUT"]
     assert (ours.source, ours.port, ours.protocol, ours.extra, ours.editable) == ("@blocklist", "22", "tcp", (), True)
     assert (both.source, both.destination, both.editable) == ("@a", "@b", True)
-    assert foreign.source == "" and foreign.extra and not foreign.editable  # somebody else's set: shown as extra
-    assert negated.source == "" and not negated.editable
+    assert negated.source == "" and negated.extra and not negated.editable
 
 
 @pytest.fixture
@@ -88,12 +90,14 @@ def test_lists_roundtrip_in_the_firewall(fw):
     assert fw.lists()["vpn"] == []
     with pytest.raises(FirewallError):
         fw.create_list("vpn")  # already there
-    assert fw.add_to_list("vpn", ["10.8.0.0/24", "10.8.0.5", "10.8.0.5"]) == 2
+    assert fw.add_to_list("vpn", ["10.8.0.0/24", "10.8.0.5", "10.8.0.5"]) == 1  # 10.8.0.5 is inside the network
     assert fw.add_to_list("vpn", ["10.8.0.5", "10.9.0.1"]) == 1  # only the new one counts
-    assert fw.lists()["vpn"] == ["10.8.0.0/24", "10.8.0.5", "10.9.0.1"]
-    fw.remove_from_list("vpn", ["10.8.0.5"])
-    fw.remove_from_list("vpn", ["10.8.0.5"])  # removing a missing address is not an error
     assert fw.lists()["vpn"] == ["10.8.0.0/24", "10.9.0.1"]
+    assert fw.add_to_list("vpn", ["10.9.0.0/16"]) == 1  # a network takes the place of the address it covers
+    assert fw.lists()["vpn"] == ["10.8.0.0/24", "10.9.0.0/16"]
+    fw.remove_from_list("vpn", ["10.9.0.0/16"])
+    fw.remove_from_list("vpn", ["10.9.0.0/16"])  # removing a missing address is not an error
+    assert fw.lists()["vpn"] == ["10.8.0.0/24"]
     fw.delete_list("vpn")
     assert "vpn" not in fw.lists()
     assert fw.lists_overview()[0] == {"blocklist": 2, "office": 2} and fw.lists_overview()[1] is None
@@ -168,7 +172,7 @@ async def test_lists_window_create_fill_and_delete():
         app.screen.query_one("#name", Input).value = "vpn"
         await pilot.press("enter")
         await settle(app, pilot, 0.5)
-        assert "lf_vpn" in runner.sets and screen.query_one("#lists", DataTable).row_count == 3
+        assert "vpn" in runner.sets and screen.query_one("#lists", DataTable).row_count == 3
         assert screen._current == "vpn"  # the new list is selected
 
         await pilot.press("a")
@@ -181,26 +185,26 @@ async def test_lists_window_create_fill_and_delete():
         app.screen.query_one(TextArea).text = "10.8.0.1, 10.8.0.0/24\n10.8.0.9"
         await pilot.click("#ok")
         await settle(app, pilot, 0.5)
-        assert sorted(runner.sets["lf_vpn"]) == ["10.8.0.0/24", "10.8.0.1", "10.8.0.9"]
-        assert screen.query_one("#entries", DataTable).row_count == 3
+        assert sorted(runner.sets["vpn"]) == ["10.8.0.0/24"]  # the two addresses are inside the network
+        assert screen.query_one("#entries", DataTable).row_count == 1
         assert runner.persist_calls >= 2  # every change is saved
 
         screen.query_one("#entries", DataTable).focus()
         await pilot.press("delete")
         await settle(app, pilot, 0.5)
-        assert len(runner.sets["lf_vpn"]) == 2
+        assert runner.sets["vpn"] == []
 
         await pilot.press("x")  # delete the list: confirm first
         await pilot.pause()
         assert isinstance(app.screen, ConfirmScreen)
         await pilot.click("#yes")
         await settle(app, pilot, 0.5)
-        assert "lf_vpn" not in runner.sets
+        assert "vpn" not in runner.sets
 
         screen.query_one("#lists", DataTable).focus()
         await pilot.press("home", "x")  # blocklist: used by a rule, so it refuses without asking
         await settle(app, pilot, 0.4)
-        assert isinstance(app.screen, ListsScreen) and "lf_blocklist" in runner.sets
+        assert isinstance(app.screen, ListsScreen) and "blocklist" in runner.sets
         await pilot.press("escape")
         await pilot.pause(0.4)
         assert not isinstance(app.screen, ListsScreen)
@@ -228,7 +232,7 @@ async def test_pick_a_list_in_the_rule_dialog_and_save():
         await pilot.click("#save")
         await settle(app, pilot, 0.5)
         added = runner.rules["INPUT"][-1][2]
-        assert added == ["-m", "set", "--match-set", "lf_office", "src", "-m", "set", "--match-set", "lf_blocklist", "dst", "-j", "ACCEPT"]
+        assert added == ["ip", "saddr", "@office", "ip", "daddr", "@blocklist", "accept"]
         table = app.query_one(DataTable)
         last = [str(c) for c in table.get_row_at(table.row_count - 1)]
         assert last[4] == "@office" and last[5] == "@blocklist"  # lists show as @name in the table
@@ -236,9 +240,9 @@ async def test_pick_a_list_in_the_rule_dialog_and_save():
         assert "списка «office»" in detail or "списка «blocklist»" in detail or "Разрешает" in detail
 
 
-async def test_rule_dialog_without_ipset_explains_instead_of_failing():
+async def test_rule_dialog_without_lists_explains_instead_of_failing():
     app, runner = make_app()
-    runner.ipset = lambda args, stdin=None: (_ for _ in ()).throw(FirewallError("Не установлен пакет ipset"))
+    app.fw.lists = lambda: (_ for _ in ()).throw(FirewallError("nft недоступен"))
     async with app.run_test(size=(130, 36)) as pilot:
         await pilot.pause(0.5)
         await pilot.press("f1")
@@ -250,7 +254,7 @@ async def test_rule_dialog_without_ipset_explains_instead_of_failing():
         app.screen.query_one("#source", Input).value = "@office"
         await pilot.click("#save")  # a typed @list is rejected by the firewall layer with the reason
         await settle(app, pilot, 0.5)
-        assert any("ipset" in str(n.message) for n in app._notifications)
+        assert any("nft" in str(n.message) for n in app._notifications)
 
         await pilot.press("f8")  # the dialog is already closed (the add failed afterwards)
         await settle(app, pilot)

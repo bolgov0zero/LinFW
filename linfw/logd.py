@@ -3,7 +3,7 @@
 It does two jobs that must not depend on the UI being open:
   * records the packets that rules with logging on send to NFLOG, one file per
     day, deleting files older than RETENTION_DAYS;
-  * samples the iptables counters every SAMPLE_SECONDS into the running totals
+  * samples the nftables counters every SAMPLE_SECONDS into the running totals
     (see counters.py), and once more on shutdown, so no hits are lost to resets.
 """
 from __future__ import annotations

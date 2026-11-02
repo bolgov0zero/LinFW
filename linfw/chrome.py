@@ -14,7 +14,7 @@ from . import __version__
 from .theme import AMBER, BACKGROUND, FAINT, GREEN, MUTED, PINK
 
 def crumb(*parts: str) -> Text:
-    """`iptables › INPUT`: the way to the current screen, the last step in pink."""
+    """`nftables › INPUT`: the way to the current screen, the last step in pink."""
     out = Text(no_wrap=True, overflow="ellipsis")
     for i, part in enumerate(parts):
         if i:

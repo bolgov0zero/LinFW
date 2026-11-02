@@ -1,10 +1,9 @@
-"""Address lists, stored as ipset sets (type hash:net, IPv4).
+"""Address lists, stored as nftables sets (type ipv4_addr, interval).
 
-A list called `office` is the kernel set `lf_office`; the prefix keeps LinFW's
-sets apart from any others on the machine (fail2ban, docker ...). A rule uses a
-list as `-m set --match-set lf_office src|dst` and the interface writes that as
-`@office`. Changing a list's contents takes effect in every rule that uses it at
-once, no rule is rewritten.
+A list called `office` is the set `office` of LinFW's own table; a rule uses it as
+`ip saddr @office` / `ip daddr @office` and the interface writes that as `@office`.
+Changing a list's contents takes effect in every rule that uses it at once, no rule
+is rewritten.
 """
 from __future__ import annotations
 
@@ -12,15 +11,10 @@ import ipaddress
 import re
 from typing import Dict, Iterable, List, Tuple
 
-LIST_PREFIX = "lf_"
-MAX_NAME = 28  # ipset names are limited to 31 characters
-MAX_ELEMENTS = 262144
+MAX_NAME = 28
 _NAME = re.compile(rf"^[A-Za-z][A-Za-z0-9_.-]{{0,{MAX_NAME - 1}}}$")
 REF = re.compile(rf"^@([A-Za-z][A-Za-z0-9_.-]{{0,{MAX_NAME - 1}}})$")
-
-
-def set_name(name: str) -> str:
-    return LIST_PREFIX + name
+_SET = re.compile(r"^set\s+(\S+)\s*\{")
 
 
 def check_name(name: str) -> str:
@@ -40,7 +34,7 @@ def list_ref(value: str):
 
 
 def normalize_entry(text: str) -> str:
-    """An IPv4 address or network as ipset prints it (a /32 is just the address)."""
+    """An IPv4 address or network as nft prints it (a /32 is just the address)."""
     text = text.strip()
     try:
         net = ipaddress.IPv4Network(text, strict=False)
@@ -68,20 +62,42 @@ def parse_entries(text: str) -> Tuple[List[str], List[str]]:
     return good, errors
 
 
+def _first_address(entry: str) -> int:
+    """The first address of an entry: `10.0.0.5`, `10.0.0.0/24` or a range `10.0.0.1-10.0.0.9`."""
+    head = entry.split("-", 1)[0].split("/", 1)[0]
+    try:
+        return int(ipaddress.IPv4Address(head))
+    except ValueError:
+        return 0
+
+
 def sort_entries(entries: Iterable[str]) -> List[str]:
-    return sorted(entries, key=lambda e: (int(ipaddress.IPv4Network(e, strict=False).network_address), e))
+    return sorted(entries, key=lambda e: (_first_address(e), e))
 
 
-def parse_save(text: str) -> Dict[str, List[str]]:
-    """`ipset save` output -> {list name: sorted entries}, our lists only."""
+def parse_sets(text: str) -> Dict[str, List[str]]:
+    """The sets in a listing of the table -> {list name: sorted entries}."""
     result: Dict[str, List[str]] = {}
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) < 2 or not parts[1].startswith(LIST_PREFIX):
-            continue
-        name = parts[1][len(LIST_PREFIX):]
-        if parts[0] == "create":
+    name = None
+    gathering = False
+    buffer = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        m = _SET.match(line)
+        if m:
+            name = m.group(1)
             result.setdefault(name, [])
-        elif parts[0] == "add" and len(parts) >= 3:
-            result.setdefault(name, []).append(parts[2])
-    return {name: sort_entries(entries) for name, entries in sorted(result.items())}
+            continue
+        if name is None:
+            continue
+        if gathering or line.startswith("elements"):
+            buffer += " " + line
+            gathering = "}" not in line
+            if not gathering:
+                body = buffer[buffer.index("{") + 1:buffer.rindex("}")]
+                result[name] = sort_entries(e.strip() for e in body.split(",") if e.strip())
+                buffer = ""
+            continue
+        if line == "}":
+            name = None
+    return {n: result[n] for n in sorted(result)}

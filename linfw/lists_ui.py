@@ -166,11 +166,11 @@ class ListsScreen(Screen):
 
     def _set_header(self) -> None:
         if self._error:
-            note = Text.assemble(("● ", RED), ("ipset недоступен", RED))
+            note = Text.assemble(("● ", RED), ("nftables недоступен", RED))
         elif not self._persistent:
-            note = Text.assemble(("● ", ORANGE), ("ipset-persistent", "dim"), (" не установлен", ORANGE))
+            note = Text.assemble(("● ", ORANGE), ("автосохранение не настроено", ORANGE))
         else:
-            note = Text.assemble(("● ", GREEN), ("ipset-persistent", "dim"), " установлен")
+            note = Text.assemble(("● ", GREEN), ("списки сохраняются вместе с правилами", "dim"))
         self.query_one(TopBar).set_status(note)
         self.query_one(StatusBar).set_right(f"списков: {len(self._data)}")
 
@@ -217,7 +217,7 @@ class ListsScreen(Screen):
         if self._error:
             status.update(Text(f"Списки недоступны: {self._error}", style=f"bold {RED}"))
         elif not self._persistent:
-            status.update(Text("Внимание: пакет ipset-persistent не установлен, списки пропадут после перезагрузки.", style=f"bold {ORANGE}"))
+            status.update(Text("Внимание: автосохранение не настроено, списки пропадут после перезагрузки.", style=f"bold {ORANGE}"))
         elif not self._data:
             status.update("Списков пока нет. N — создать первый, потом A — добавить в него адреса.")
         else:

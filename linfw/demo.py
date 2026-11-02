@@ -1,30 +1,37 @@
-"""In-memory stand-in for iptables, used by `linfw --demo` and the tests.
+"""In-memory stand-in for nftables, used by `linfw --demo` and the tests.
 
-It understands just the subset of the command line that Firewall emits and
-renders `iptables-save -c` text, so the real parser runs against it.
+It understands just the subset of nft commands that Firewall emits and prints the table
+in the format of `nft list table ip linfw`, so the real parser runs against it.
 """
 from __future__ import annotations
 
+import copy
+import ipaddress
 import random
-import shlex
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from .journal import LogEntry
-from .model import CHAINS, FirewallError
+from .model import CHAINS, FAMILY, RULE_TAG, TABLE, FirewallError
+from .parser import words
+from .render import rule_words
 
 _SAMPLE = [
-    ("INPUT", "-p tcp --dport 22 -j ACCEPT", 1532),
-    ("INPUT", "-p tcp -m multiport --dports 80,443 -j ACCEPT", 20871),
-    ("INPUT", "-p icmp -j ACCEPT", 87),
-    ("INPUT", "-m set --match-set lf_blocklist src -j DROP", 311),
-    ("INPUT", "-p udp --dport 161 -s 10.0.0.0/8 -j REJECT --reject-with icmp-port-unreachable", 12),
-    ("INPUT", "-j DROP", 5400),
-    ("OUTPUT", "-p tcp -d 198.51.100.7 --dport 25 -j DROP", 3),
-    ("OUTPUT", "-j ACCEPT", 120442),
-    ("FORWARD", "-s 192.168.1.0/24 -d 10.10.0.0/16 -j ACCEPT", 9120),
-    ("FORWARD", "-j REJECT --reject-with icmp-port-unreachable", 15),
+    ("INPUT", "tcp dport 22 accept", 1532),
+    ("INPUT", "tcp dport {80,443} accept", 20871),
+    ("INPUT", "ip protocol icmp accept", 87),
+    ("INPUT", "ip saddr @blocklist drop", 311),
+    ("INPUT", "udp dport 161 ip saddr 10.0.0.0/8 reject", 12),
+    ("INPUT", "drop", 5400),
+    ("OUTPUT", "tcp dport 25 ip daddr 198.51.100.7 drop", 3),
+    ("OUTPUT", "accept", 120442),
+    ("FORWARD", "ip saddr 192.168.1.0/24 ip daddr 10.10.0.0/16 accept", 9120),
+    ("FORWARD", "reject", 15),
 ]
+
+_CHAIN = re.compile(r"^add chain \S+ \S+ (\w+) \{.*policy (\w+);")
+_HOOKS = {"INPUT": "input", "OUTPUT": "output", "FORWARD": "forward"}
 
 
 _DEMO_HITS = [
@@ -41,93 +48,142 @@ _DEMO_HITS = [
 
 class DemoRunner:
     def __init__(self, sample: bool = True, jitter: bool = True) -> None:
-        self.policies = {"INPUT": "ACCEPT", "FORWARD": "DROP", "OUTPUT": "ACCEPT"}
-        self.user_chains: List[str] = []
-        self.rules: Dict[str, List[List]] = {c: [] for c in CHAINS}  # [pkts, bytes, tokens]
+        self.exists = False
+        self.policies: Dict[str, str] = {}
+        self.rules: Dict[str, List[List]] = {}  # chain -> [[pkts, bytes, words, tag]]
         self.persist_calls = 0
+        self.persisted = ""
         self._jitter = jitter
-        # address lists: ipset name -> entries (the real thing lives in the kernel)
+        # address lists: set name -> entries (the real thing lives in the kernel)
         self.sets: Dict[str, List[str]] = {}
-        if sample:
-            self.sets = {
-                "lf_office": ["192.168.1.0/24", "10.0.0.5"],
-                "lf_blocklist": ["198.51.100.7", "203.0.113.0/24"],
-            }
         self._hits: List[LogEntry] = []
         if sample:
+            self.exists = True
+            self.policies = {"INPUT": "accept", "FORWARD": "drop", "OUTPUT": "accept"}
+            self.rules = {c: [] for c in CHAINS}
+            self.sets = {"office": ["192.168.1.0/24", "10.0.0.5"], "blocklist": ["198.51.100.7", "203.0.113.0/24"]}
+            for chain, line, pkts in _SAMPLE:
+                self.rules[chain].append([pkts, pkts * 90, words(line), RULE_TAG])
             for _ in range(24):
                 self._add_hit(datetime.now() - timedelta(seconds=random.randint(5, 3600)))
             self._hits.sort(key=lambda e: e.time)
-        if sample:
-            for chain, line, pkts in _SAMPLE:
-                self.rules[chain].append([pkts, pkts * 90, shlex.split(line)])
 
-    def _chain(self, name: str) -> List[List]:
-        if name not in self.rules:
-            raise FirewallError(f"iptables: No chain/target/match by that name: {name}")
-        return self.rules[name]
+    def add_rule(self, chain: str, line: str, pkts: int = 0, nbytes: int = 0, tag: str = RULE_TAG) -> None:
+        """Put a rule straight into the table (tests): `tcp dport 22 accept`. The table and the chain are made if needed."""
+        self.exists = True
+        self.rules.setdefault(chain, [])
+        self.policies.setdefault(chain, "accept")
+        self.rules[chain].append([pkts, nbytes, words(line), tag])
 
-    @staticmethod
-    def _split_counters(args: List[str]) -> Tuple[List[str], int, int]:
-        if "-c" in args:
-            i = args.index("-c")
-            return args[:i] + args[i + 3:], int(args[i + 1]), int(args[i + 2])
-        return args, 0, 0
+    # -- what `nft list table` prints ------------------------------------
 
-    def _check_sets(self, tokens: List[str]) -> None:
-        """The kernel refuses a rule that names a set that does not exist."""
-        for i, tok in enumerate(tokens[:-1]):
-            if tok == "--match-set" and tokens[i + 1] not in self.sets:
-                raise FirewallError(f"iptables: Set {tokens[i + 1]} doesn't exist.")
-
-    def ipt(self, args: List[str]) -> None:
-        if args[0] in ("-A", "-I", "-R"):
-            self._check_sets(args)
-        op, rest = args[0], args[1:]
-        if op == "-N":
-            if rest[0] in self.user_chains:
-                raise FirewallError("iptables: Chain already exists.")
-            self.user_chains.append(rest[0])
-            return
-        chain = self._chain(rest[0])
-        if op == "-D":
-            self._index(chain, int(rest[1]))
-            del chain[int(rest[1]) - 1]
-        elif op == "-A":
-            tokens, pkts, nbytes = self._split_counters(rest[1:])
-            chain.append([pkts, nbytes, tokens])
-        elif op == "-I":
-            tokens, pkts, nbytes = self._split_counters(rest[2:])
-            if not 1 <= int(rest[1]) <= len(chain) + 1:
-                raise FirewallError("iptables: Index of insertion too big.")
-            chain.insert(int(rest[1]) - 1, [pkts, nbytes, tokens])
-        elif op == "-R":
-            self._index(chain, int(rest[1]))
-            tokens, pkts, nbytes = self._split_counters(rest[2:])
-            chain[int(rest[1]) - 1] = [pkts, nbytes, tokens]
-        else:
-            raise FirewallError(f"demo: unsupported operation {op}")
-
-    @staticmethod
-    def _index(chain: List[List], n: int) -> None:
-        if not 1 <= n <= len(chain):
-            raise FirewallError("iptables: Index of deletion too big.")
-
-    def save_text(self) -> str:
+    def list_table(self) -> Optional[str]:
+        if not self.exists:
+            return None
         if self._jitter:
             for chain in self.rules.values():
                 for entry in chain:
                     if random.random() < 0.2:
                         entry[0] += random.randint(1, 40)
                         entry[1] += random.randint(60, 4000)
-        lines = ["*filter"]
-        lines += [f":{c} {self.policies[c]} [0:0]" for c in CHAINS]
-        lines += [f":{c} - [0:0]" for c in self.user_chains]
-        for name, chain in self.rules.items():
-            for pkts, nbytes, tokens in chain:
-                lines.append(f"[{pkts}:{nbytes}] -A {name} {shlex.join(tokens)}")
-        lines.append("COMMIT")
-        return "\n".join(lines) + "\n"
+        out = [f"table {FAMILY} {TABLE} {{"]
+        for name, entries in self.sets.items():
+            out += [f"\tset {name} {{", "\t\ttype ipv4_addr", "\t\tflags interval"]
+            if entries:
+                out.append(f"\t\telements = {{ {', '.join(entries)} }}")
+            out += ["\t}", ""]
+        for chain, rules in self.rules.items():
+            out += [f"\tchain {chain.lower()} {{", f"\t\ttype filter hook {_HOOKS[chain]} priority filter; policy {self.policies.get(chain, 'accept')};"]
+            out += [f"\t\t{rule_words(spec, tag, (pkts, nbytes), off=False)}" for pkts, nbytes, spec, tag in rules]
+            out += ["\t}", ""]
+        out[-1:] = ["}"]
+        return "\n".join(out) + "\n"
+
+    # -- what `nft -f -` does ---------------------------------------------
+
+    def nft(self, lines: List[str]) -> None:
+        saved = copy.deepcopy((self.exists, self.policies, self.rules, self.sets))
+        try:
+            for line in lines:
+                self._command(line.strip())
+        except FirewallError:
+            self.exists, self.policies, self.rules, self.sets = saved  # a transaction: all or nothing
+            raise
+
+    def _chain(self, name: str) -> List[List]:
+        if name.upper() not in self.rules:
+            raise FirewallError("No such file or directory")
+        return self.rules[name.upper()]
+
+    def _set(self, name: str) -> List[str]:
+        if name not in self.sets:
+            raise FirewallError("No such file or directory")
+        return self.sets[name]
+
+    def _uses(self, name: str) -> bool:
+        return any(f"@{name}" in spec for rules in self.rules.values() for _, _, spec, _ in rules)
+
+    def _command(self, line: str) -> None:
+        m = _CHAIN.match(line)
+        if m:
+            self.rules.setdefault(m.group(1).upper(), [])
+            self.policies.setdefault(m.group(1).upper(), m.group(2))
+            return
+        w = words(line)
+        if w[:3] == ["table", FAMILY, TABLE]:
+            self.exists = True
+        elif w[:4] == ["delete", "table", FAMILY, TABLE]:
+            self.exists, self.rules, self.policies, self.sets = False, {}, {}, {}
+        elif w[:2] == ["flush", "chain"]:
+            self._chain(w[4])[:] = []
+        elif w[:2] == ["add", "rule"]:
+            self._add_rule(w[4], w[5:])
+        elif w[:2] == ["add", "set"]:
+            if w[4] in self.sets:
+                raise FirewallError("File exists")
+            self.sets[w[4]] = []
+        elif w[:2] == ["delete", "set"]:
+            self._set(w[4])
+            if self._uses(w[4]):
+                raise FirewallError("Could not process rule: Device or resource busy")
+            del self.sets[w[4]]
+        elif w[:2] == ["add", "element"]:
+            entries = self._set(w[4])
+            for item in w[5][1:-1].split(","):
+                if item in entries:
+                    continue
+                net = ipaddress.IPv4Network(item, strict=False)
+                if any(net.overlaps(ipaddress.IPv4Network(e, strict=False)) for e in entries):
+                    raise FirewallError("interval overlaps with an existing one")
+                entries.append(item)
+        elif w[:2] == ["delete", "element"]:
+            entries = self._set(w[4])
+            for item in w[5][1:-1].split(","):
+                if item not in entries:
+                    raise FirewallError("element does not exist")
+                entries.remove(item)
+        else:
+            raise FirewallError(f"demo: unsupported command {line}")
+
+    def _add_rule(self, chain: str, rest: List[str]) -> None:
+        rules = self._chain(chain)
+        pkts = nbytes = 0
+        tag = ""
+        if "comment" in rest:
+            i = rest.index("comment")
+            tag = rest[i + 1].strip('"')
+            del rest[i:i + 2]
+        if "counter" in rest:
+            i = rest.index("counter")
+            if rest[i + 1:i + 2] == ["packets"]:
+                pkts, nbytes = int(rest[i + 2]), int(rest[i + 4])
+                del rest[i:i + 5]
+            else:
+                del rest[i]
+        for word in rest:
+            if word.startswith("@") and word[1:] not in self.sets:
+                raise FirewallError("No such file or directory")
+        rules.append([pkts, nbytes, rest, tag])
 
     def _add_hit(self, when: datetime) -> None:
         chain, action, proto, src, dst, port = random.choice(_DEMO_HITS)
@@ -146,50 +202,13 @@ class DemoRunner:
     def logd_state(self) -> Optional[str]:
         return "active"
 
-    def ipset(self, args: List[str], stdin: Optional[str] = None) -> str:
-        """The few ipset commands LinFW uses, on in-memory sets."""
-        cmd = args[0]
-        if cmd == "list":
-            return "".join(f"{name}\n" for name in self.sets)
-        if cmd == "save":
-            out = []
-            for name, entries in self.sets.items():
-                out.append(f"create {name} hash:net family inet hashsize 1024 maxelem 262144")
-                out += [f"add {name} {e}" for e in entries]
-            return "\n".join(out) + ("\n" if out else "")
-        if cmd == "create":
-            if args[1] in self.sets:
-                raise FirewallError("Set cannot be created: set with the same name already exists")
-            self.sets[args[1]] = []
-        elif cmd == "destroy":
-            name = args[1]
-            if name not in self.sets:
-                raise FirewallError("The set with the given name does not exist")
-            if any(name in tokens for chain in self.rules.values() for _, _, tokens in chain):
-                raise FirewallError("Set cannot be destroyed: it is in use by a kernel component")
-            del self.sets[name]
-        elif cmd == "restore":
-            for line in (stdin or "").splitlines():
-                verb, name, entry = line.split()[:3]
-                if name not in self.sets:
-                    raise FirewallError("The set with the given name does not exist")
-                if verb == "add" and entry not in self.sets[name]:
-                    self.sets[name].append(entry)
-                elif verb == "del" and entry in self.sets[name]:
-                    self.sets[name].remove(entry)
-        else:
-            raise FirewallError(f"demo: unsupported ipset command {cmd}")
-        return ""
-
-    def ipset_problem(self) -> Optional[str]:
-        return None
-
-    def ipset_persistent(self) -> bool:
-        return True
-
-    def persist(self) -> str:
+    def persist(self, text: str) -> str:
         self.persist_calls += 1
+        self.persisted = text
         return "demo (не сохраняется)"
 
     def persist_info(self) -> Optional[str]:
         return "demo"
+
+    def problem(self) -> Optional[str]:
+        return None
